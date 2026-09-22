@@ -47,9 +47,95 @@ FROM mysql_query('mysql_db', 'SELECT my_function(?)', [42]);
 
 Therefore, first verify whether a dedicated function wrapper is actually needed. Avoid adding a second API unless it provides capabilities that `mysql_query` cannot provide.
 
-## 4. Architecture
+## 4. Design comparison: `mysql_call` versus native DuckDB `CALL`
 
-### 4.1 Add procedure-call bind and execution state
+### 4.1 Native DuckDB `CALL`
+
+Native DuckDB `CALL` is the natural SQL syntax for invoking a procedure registered in DuckDB's catalog. It gives users a concise statement form and allows DuckDB to resolve the procedure, bind arguments, plan execution, and report errors using its normal procedure infrastructure:
+
+```sql
+CALL local_procedure(2026, 'US');
+```
+
+However, native `CALL` is not automatically a remote execution mechanism. A MySQL procedure is owned by the remote server, uses MySQL's procedure and parameter semantics, and may return MySQL-specific result sets or `OUT`/`INOUT` values. Supporting direct syntax such as:
+
+```sql
+CALL mysql_db.report_sales(2026, 'US');
+```
+
+would therefore require integration with DuckDB's parser, binder, catalog, planner, execution engine, and extension API. It would also require defining how a remote catalog entry maps to DuckDB's procedure abstraction and how remote result-set behavior maps to DuckDB's single statement result.
+
+### 4.2 Extension table function: `mysql_call`
+
+The proposed MVP uses an extension table function:
+
+```sql
+SELECT *
+FROM mysql_call('mysql_db', 'report_sales', 2026, 'US');
+```
+
+This approach has several advantages:
+
+- it requires no DuckDB core parser changes;
+- it can be implemented and released in the MySQL extension;
+- it naturally exposes a procedure's tabular result set;
+- it can reuse the existing `mysql_query` table-function, connection-pool, prepared-statement, and result-streaming patterns;
+- it makes the remote catalog and procedure name explicit;
+- it allows the extension to define MySQL-specific handling for multiple result sets and output parameters.
+
+The main disadvantages are more verbose syntax and less integration with native DuckDB procedure discovery, autocomplete, and procedure metadata.
+
+### 4.3 Recommended staged approach
+
+Use `mysql_call` as the initial public API and keep native `CALL` syntax as a possible follow-up enhancement:
+
+| Concern | `mysql_call` table function | Native DuckDB `CALL` integration |
+| --- | --- | --- |
+| Implementation location | MySQL extension only | DuckDB core plus MySQL extension |
+| Parser changes | None | Required for remote catalog-qualified calls, unless existing syntax is reusable |
+| Result-set handling | Explicitly designed by the extension | Must fit DuckDB procedure result semantics |
+| MySQL `OUT`/`INOUT` | Can expose extension-specific behavior | Requires a general DuckDB procedure contract or adapter |
+| Multiple result sets | Can define first-result or selector policy | Needs a core-level representation or truncation policy |
+| Security boundary | Explicit remote catalog and identifier handling | More implicit after catalog registration |
+| Backward compatibility | Low risk, additive extension API | Higher risk because parser/binder behavior changes |
+| User ergonomics | More verbose | More familiar SQL syntax |
+| Portability | Works with MySQL-extension versions independently | Tied to DuckDB core and extension API versions |
+
+### 4.4 When native `CALL` becomes worthwhile
+
+Consider native syntax only after the extension table function has established stable semantics for:
+
+1. remote procedure name resolution;
+2. input parameter conversion and prepared binding;
+3. connection pinning;
+4. output-parameter representation;
+5. first and subsequent result-set behavior;
+6. error and transaction handling.
+
+A later native integration could register remote procedures dynamically or add a remote procedure catalog entry that delegates execution to the MySQL extension. The adapter should still preserve the explicit remote catalog association and should not hide whether a procedure executes locally or remotely.
+
+A possible future syntax is:
+
+```sql
+CALL mysql_db.report_sales(2026, 'US');
+```
+
+but this should not be committed until the following questions are answered:
+
+- Does `mysql_db.report_sales` resolve as a DuckDB catalog procedure or as a special remote-call expression?
+- How are procedures discovered and refreshed from `information_schema.PARAMETERS`?
+- How are `OUT` and `INOUT` values returned to the caller?
+- What happens when a procedure emits multiple result sets?
+- Can native `CALL` participate in DuckDB transactions, or is the remote transaction boundary independent?
+- How are remote MySQL and local DuckDB type systems reconciled?
+
+### 4.5 Decision
+
+For the MVP, implement `mysql_call` as an extension table function. Document that it is the supported remote-procedure API and that `mysql_query` remains the supported escape hatch for scalar MySQL functions and arbitrary remote SQL. Revisit native `CALL` only after the remote execution contract is stable and there is a concrete need for catalog integration or more concise syntax.
+
+## 5. Architecture
+
+### 5.1 Add procedure-call bind and execution state
 
 Add a `MySQLCallFunction` table function and corresponding bind data, following the patterns used by `MySQLQueryFunction` and `MySQLQueryBindData`.
 
@@ -64,7 +150,7 @@ The bind data should contain at least:
 
 The execution state should own or pin the connection for the complete operation and retain the current result set while rows are streamed to DuckDB.
 
-### 4.2 Add multi-result handling
+### 5.2 Add multi-result handling
 
 A MySQL procedure can produce multiple results. Extend the connector/result abstraction to:
 
@@ -82,13 +168,13 @@ The initial output policy should be explicit and documented:
 
 A later enhancement can expose a result-set index or a nested result representation.
 
-### 4.3 Connection capabilities
+### 5.3 Connection capabilities
 
 Review connection creation in `mysql_connection.cpp` and ensure the required multi-result capability is requested. Add only the minimum client flags necessary.
 
 Audit the effect on existing operations, especially `mysql_execute`, because enabling multi-statement behavior can change how semicolon-separated SQL is handled. Do not weaken parameter binding or introduce string concatenation for values.
 
-### 4.4 Parameter binding
+### 5.4 Parameter binding
 
 For `IN` parameters:
 
@@ -113,7 +199,7 @@ Use unique generated variable names and execute the `CALL` plus output retrieval
 
 Native output binding through `MYSQL_STMT` can be considered after the session-variable approach is working.
 
-### 4.5 Result schema
+### 5.5 Result schema
 
 For the MVP:
 
@@ -123,7 +209,7 @@ For the MVP:
 
 Prefer a stable schema per invocation. Do not attempt to combine unrelated schemas from multiple result sets into one table.
 
-## 5. Implementation phases
+## 6. Implementation phases
 
 ### Phase 1: investigate and define contracts
 
@@ -201,7 +287,7 @@ Add SQL logic/integration tests for:
 - remote procedure error;
 - connection reuse after success and failure.
 
-## 6. Security and correctness requirements
+## 7. Security and correctness requirements
 
 - Never interpolate parameter values into SQL.
 - Quote only validated identifiers.
@@ -212,7 +298,7 @@ Add SQL logic/integration tests for:
 - Verify behavior under concurrent calls using separate pooled connections.
 - Audit whether enabling multi-result or multi-statement client flags changes existing APIs.
 
-## 7. Recommended MVP
+## 8. Recommended MVP
 
 The first pull request should implement:
 
@@ -224,9 +310,9 @@ The first pull request should implement:
 6. comprehensive integration tests;
 7. README examples.
 
-Defer `OUT`/`INOUT` parameters, information-schema validation, and nested multi-result output until the MVP proves the connection and result lifecycle is correct.
+Defer `OUT`/`INOUT` parameters, information-schema validation, nested multi-result output, and native DuckDB `CALL` integration until the MVP proves the connection and result lifecycle is correct.
 
-## 8. Acceptance criteria
+## 9. Acceptance criteria
 
 The feature is ready for review when:
 
