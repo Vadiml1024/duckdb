@@ -667,3 +667,86 @@ index 3d654ba..28f116c 100644
  			}
  		}
  	}
+diff --git a/test/sql/mysql_call.test b/test/sql/mysql_call.test
+new file mode 100644
+index 0000000..a9417a0
+--- /dev/null
++++ b/test/sql/mysql_call.test
+@@ -0,0 +1,77 @@
++# name: test/sql/mysql_call.test
++# description: Test mysql_call stored procedures
++# group: [sql]
++
++require mysql_scanner
++
++require-env MYSQL_TEST_DATABASE_AVAILABLE
++
++statement ok
++ATTACH 'host=localhost user=root port=0 database=mysqlscanner' AS s (TYPE MYSQL_SCANNER)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS call_row_proc', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS call_norow_proc', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE call_row_proc(IN p INT) SELECT p + 1 AS v', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE call_norow_proc(IN p INT) SET @duckdb_call_test = p', prepare=FALSE)
++
++query I
++FROM mysql_call('s', 'call_row_proc', params=row(41))
++----
++42
++
++query I
++CALL mysql_call('s', 'call_row_proc', params=row(42))
++----
++43
++
++query I
++FROM mysql_call('s', 'call_norow_proc', params=row(7))
++----
++0
++
++statement ok
++SET VARIABLE p1 = mysql_create_params();
++
++statement ok
++PREPARE call_stmt AS FROM mysql_call('s', 'call_row_proc', params_handle=getvariable('p1'))
++
++statement ok
++SELECT mysql_bind_params(getvariable('p1'), row(44));
++
++query I
++EXECUTE call_stmt
++----
++45
++
++statement ok
++DEALLOCATE call_stmt
++
++statement ok
++RESET VARIABLE p1
++
++statement error
++FROM mysql_call('s', 'call_row_proc', params=row(1), stream_results=TRUE)
++----
++Query result streaming cannot be used with 'mysql_call'
++
++# verify the connection can be reused after CALL (all additional results drained)
++query I
++FROM mysql_query('s', 'SELECT 46')
++----
++46
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE call_row_proc', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE call_norow_proc', prepare=FALSE)
++
++statement ok
++DETACH s
