@@ -1,0 +1,665 @@
+diff --git a/README.md b/README.md
+index a7ea5cb..7bf6d4f 100644
+--- a/README.md
++++ b/README.md
+@@ -168,6 +168,36 @@ SELECT * FROM mysql_db.tmp;
+ 
+ > Note that DDL statements are not transactional in MySQL.
+ 
++## Stored Procedure Calls
++
++Remote MySQL stored procedures can be invoked through the `mysql_call` table function. The first argument is the attached MySQL catalog, the second argument is the remote procedure name, and `IN` parameter values are passed with the named `params` argument.
++
++```sql
++ATTACH 'host=localhost user=root port=0 database=mysqlscanner' AS mysql_db (TYPE mysql_scanner);
++
++SELECT *
++FROM mysql_call('mysql_db', 'report_sales', params := row(2026, 'US'));
++```
++
++The `mysql_call` function uses prepared statements for all `IN` parameters and follows the same connection and transaction rules as `mysql_query`:
++
++- remote procedure calls run on the current MySQL transaction connection unless `connection := mysql_pin_connection(...)` is used;
++- pinned connections stay pinned until the call result is fully consumed or discarded;
++- all remaining MySQL result sets are drained before the connection is returned to the pool.
++
++The result contract is stable for the MVP:
++
++- if the procedure produces one or more row-producing result sets, DuckDB returns only the first row-producing result set;
++- if the procedure produces no row-producing result set, DuckDB returns a single `rowcount BIGINT` column;
++- any additional result sets are drained and discarded before the connection is reused.
++
++Current limitations:
++
++- only `IN` parameters are supported;
++- `OUT` and `INOUT` parameters are not yet supported;
++- the API is extension-native (`mysql_call(...)`), not dotted remote syntax such as `CALL mysql_db.proc(...)`;
++- scalar MySQL functions should continue to use `mysql_query`, for example `FROM mysql_query('mysql_db', 'SELECT my_function(?)', params := row(42))`.
++
+ ## Settings
+ |                name                |                          description                           | default |
+ |------------------------------------|----------------------------------------------------------------|---------|
+diff --git a/src/include/mysql_connection.hpp b/src/include/mysql_connection.hpp
+index e69f870..6c53da1 100644
+--- a/src/include/mysql_connection.hpp
++++ b/src/include/mysql_connection.hpp
+@@ -78,6 +78,10 @@ public:
+ 	unique_ptr<MySQLResult> Query(const string &query, const vector<Value> &params, MySQLResultStreaming streaming);
+ 	unique_ptr<MySQLResult> QueryStmt(MySQLStatement &stmt, const vector<Value> &params,
+ 	                                  MySQLResultStreaming streaming);
++	unique_ptr<MySQLResult> QueryProcedure(const string &query, const vector<Value> &params,
++	                                       MySQLResultStreaming streaming);
++	unique_ptr<MySQLResult> QueryProcedureStmt(MySQLStatement &stmt, const vector<Value> &params,
++	                                           MySQLResultStreaming streaming);
+ 	unique_ptr<MySQLStatement> Prepare(const string &query);
+ 
+ 	vector<IndexInfo> GetIndexInfo(const string &table_name);
+diff --git a/src/include/mysql_result.hpp b/src/include/mysql_result.hpp
+index e5f4f37..0e7908b 100644
+--- a/src/include/mysql_result.hpp
++++ b/src/include/mysql_result.hpp
+@@ -30,10 +30,13 @@ public:
+ 	MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+ 	            const string &connection_string_p, unsigned long connection_id_p, MySQLResultStreaming streaming_p,
+ 	            idx_t affected_rows_p, vector<MySQLField> fields_p = vector<MySQLField>(),
+-	            MySQLResultStatementLifetime stmt_lifetime_p = MySQLResultStatementLifetime::OWNED);
++	            MySQLResultStatementLifetime stmt_lifetime_p = MySQLResultStatementLifetime::OWNED,
++	            bool drain_additional_results_p = false);
+ 
+ 	~MySQLResult();
+ 
++	void Finalize();
++
+ 	string GetString(idx_t col);
+ 	int32_t GetInt32(idx_t col);
+ 	int64_t GetInt64(idx_t col);
+@@ -62,6 +65,8 @@ private:
+ 	DataChunk data_chunk;
+ 	idx_t row_idx = static_cast<idx_t>(-1);
+ 	bool exhausted = false;
++	bool drain_additional_results = false;
++	bool additional_results_drained = false;
+ 
+ 	bool FetchNext();
+ 	void HandleTruncatedData();
+@@ -69,6 +74,8 @@ private:
+ 	void CheckColumnIdx(idx_t col);
+ 	void CheckNotNull(idx_t col);
+ 	void CheckType(idx_t col, LogicalTypeId type_id);
++	void DrainRemainingResults();
++	void DrainExtraResultSets();
+ 	bool TryCancelQuery();
+ };
+ 
+diff --git a/src/include/mysql_scanner.hpp b/src/include/mysql_scanner.hpp
+index 48a5482..6a9437a 100644
+--- a/src/include/mysql_scanner.hpp
++++ b/src/include/mysql_scanner.hpp
+@@ -109,6 +109,11 @@ public:
+ 	MySQLExecuteFunction();
+ };
+ 
++class MySQLCallFunction : public TableFunction {
++public:
++	MySQLCallFunction();
++};
++
+ class MySQLPinConnectionFunction : public ScalarFunction {
+ public:
+ 	MySQLPinConnectionFunction();
+diff --git a/src/include/storage/mysql_catalog.hpp b/src/include/storage/mysql_catalog.hpp
+index cad8ae8..9890d83 100644
+--- a/src/include/storage/mysql_catalog.hpp
++++ b/src/include/storage/mysql_catalog.hpp
+@@ -89,6 +89,7 @@ public:
+ 	static void MaterializeMySQLScans(PhysicalOperator &op);
+ 	static bool IsMySQLScan(const string &name);
+ 	static bool IsMySQLQuery(const string &name);
++	static bool IsMySQLCall(const string &name);
+ 
+ 	static dbconnector::attached::AttachedCatalog Lookup(ClientContext &ctx, const Identifier &name);
+ 
+diff --git a/src/mysql_connection.cpp b/src/mysql_connection.cpp
+index e32e0d7..c4c5532 100644
+--- a/src/mysql_connection.cpp
++++ b/src/mysql_connection.cpp
+@@ -116,6 +116,84 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
+ 	return affected_rows;
+ }
+ 
++static void StoreStatementResult(const string &query, MYSQL_STMT *stmt) {
++	bool btrue = true;
++	auto res_attr = mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue);
++	if (res_attr != 0) {
++		throw IOException("Failed to set STMT_ATTR_UPDATE_MAX_LENGTH for MySQL query \"%s\": %s\n", query.c_str(),
++		                  mysql_stmt_error(stmt));
++	}
++
++	int res_store = mysql_stmt_store_result(stmt);
++	if (res_store != 0) {
++		throw IOException("Failed to store result for MySQL query \"%s\": %s\n", query.c_str(),
++		                  mysql_stmt_error(stmt));
++	}
++}
++
++static void TryDrainProcedureStatement(MYSQL_STMT *stmt) {
++	if (!stmt) {
++		return;
++	}
++	while (true) {
++		if (mysql_stmt_field_count(stmt) > 0) {
++			bool btrue = true;
++			if (mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue) != 0) {
++				return;
++			}
++			if (mysql_stmt_store_result(stmt) != 0) {
++				return;
++			}
++		}
++		mysql_stmt_free_result(stmt);
++		int next_result = mysql_stmt_next_result(stmt);
++		if (next_result != 0) {
++			return;
++		}
++	}
++}
++
++static unique_ptr<MySQLResult> CreateProcedureResult(const string &query, MySQLStatementPtr stmt,
++                                                     const MySQLTypeConfig &type_config,
++                                                     const string &connection_string, unsigned long connection_id,
++                                                     MySQLResultStreaming streaming, idx_t affected_rows,
++                                                     vector<MySQLField> fields,
++                                                     MySQLResultStatementLifetime stmt_lifetime,
++                                                     bool current_result_stored) {
++	try {
++		while (true) {
++			if (mysql_stmt_field_count(stmt.get()) > 0) {
++				if (fields.empty()) {
++					fields = MySQLField::ReadFields(query, stmt.get(), type_config);
++				}
++				if (!current_result_stored && streaming != MySQLResultStreaming::ALLOW_STREAMING) {
++					StoreStatementResult(query, stmt.get());
++				}
++				return make_uniq<MySQLResult>(query, std::move(stmt), type_config, connection_string, connection_id,
++				                              streaming, idx_t(-1), std::move(fields), stmt_lifetime, true);
++			}
++
++			fields.clear();
++			affected_rows = mysql_stmt_affected_rows(stmt.get());
++			mysql_stmt_free_result(stmt.get());
++
++			int next_result = mysql_stmt_next_result(stmt.get());
++			if (next_result < 0) {
++				return make_uniq<MySQLResult>(query, std::move(stmt), type_config, connection_string, connection_id,
++				                              streaming, affected_rows, vector<MySQLField>(), stmt_lifetime);
++			}
++			if (next_result > 0) {
++				throw IOException("Failed to fetch next result for MySQL query \"%s\": %s\n", query.c_str(),
++				                  mysql_stmt_error(stmt.get()));
++			}
++			current_result_stored = false;
++		}
++	} catch (...) {
++		TryDrainProcedureStatement(stmt.get());
++		throw;
++	}
++}
++
+ unique_ptr<MySQLResult> MySQLConnection::QueryInternal(const string &query, const vector<Value> &params,
+                                                        MySQLResultStreaming streaming,
+                                                        MySQLConnectorInterface con_interface) {
+@@ -166,6 +244,41 @@ unique_ptr<MySQLResult> MySQLConnection::QueryStmt(MySQLStatement &stmt, const v
+ 	                              streaming, affected_rows, stmt.FieldsCopy(), MySQLResultStatementLifetime::BORROWED);
+ }
+ 
++unique_ptr<MySQLResult> MySQLConnection::QueryProcedure(const string &query, const vector<Value> &params,
++                                               MySQLResultStreaming streaming) {
++	auto con = GetConn();
++	bool result_streaming = streaming == MySQLResultStreaming::ALLOW_STREAMING;
++	auto stmt = MySQLStatementPtr(nullptr, MySQLStatementDelete);
++	{
++		lock_guard<mutex> guard(query_lock);
++		stmt = MySQLStatementPtr(mysql_stmt_init(con), MySQLStatementDelete);
++		if (!stmt) {
++			throw IOException("Failed to initialize MySQL query \"%s\": %s\n", query.c_str(), mysql_error(con));
++		}
++	}
++
++	idx_t affected_rows = MySQLExecute(stmt.get(), query, params, result_streaming);
++	unsigned long connection_id = connection->GetID();
++	bool current_result_stored = !result_streaming && affected_rows == static_cast<idx_t>(-1);
++	return CreateProcedureResult(query, std::move(stmt), type_config, connection_string, connection_id, streaming,
++	                             affected_rows, vector<MySQLField>(), MySQLResultStatementLifetime::OWNED,
++	                             current_result_stored);
++}
++
++unique_ptr<MySQLResult> MySQLConnection::QueryProcedureStmt(MySQLStatement &stmt, const vector<Value> &params,
++                                                   MySQLResultStreaming streaming) {
++	bool result_streaming = streaming == MySQLResultStreaming::ALLOW_STREAMING;
++	bool prepared = true;
++	idx_t affected_rows = MySQLExecute(stmt.get(), stmt.Query(), params, result_streaming, prepared);
++	MYSQL_STMT *stmt_ptr_bare = stmt.get();
++	MySQLStatementPtr stmt_ptr(stmt_ptr_bare, MySQLStatementDelete);
++	unsigned long connection_id = connection->GetID();
++	bool current_result_stored = !result_streaming && affected_rows == static_cast<idx_t>(-1);
++	return CreateProcedureResult(stmt.Query(), std::move(stmt_ptr), type_config, connection_string, connection_id,
++	                             streaming, affected_rows, stmt.FieldsCopy(),
++	                             MySQLResultStatementLifetime::BORROWED, current_result_stored);
++}
++
+ unique_ptr<MySQLStatement> MySQLConnection::Prepare(const string &query) {
+ 	lock_guard<mutex> guard(query_lock);
+ 	auto con = GetConn();
+diff --git a/src/mysql_extension.cpp b/src/mysql_extension.cpp
+index bce34a3..88de960 100644
+--- a/src/mysql_extension.cpp
++++ b/src/mysql_extension.cpp
+@@ -126,6 +126,9 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	MySQLQueryFunction query_function;
+ 	loader.RegisterFunction(query_function);
+ 
++	MySQLCallFunction call_function;
++	loader.RegisterFunction(call_function);
++
+ 	MySQLPinConnectionFunction pin_connection_function;
+ 	loader.RegisterFunction(pin_connection_function);
+ 
+diff --git a/src/mysql_result.cpp b/src/mysql_result.cpp
+index f8d8295..e94e7d0 100644
+--- a/src/mysql_result.cpp
++++ b/src/mysql_result.cpp
+@@ -57,10 +57,11 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
+ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+                          const string &connection_string_p, unsigned long connection_id_p,
+                          MySQLResultStreaming streaming_p, idx_t affected_rows_p, vector<MySQLField> fields_p,
+-                         MySQLResultStatementLifetime stmt_lifetime_p)
++                         MySQLResultStatementLifetime stmt_lifetime_p, bool drain_additional_results_p)
+     : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)),
+       connection_string(connection_string_p), connection_id(connection_id_p), streaming(streaming_p),
+-      affected_rows(affected_rows_p), fields(std::move(fields_p)), stmt_lifetime(stmt_lifetime_p) {
++      affected_rows(affected_rows_p), fields(std::move(fields_p)), stmt_lifetime(stmt_lifetime_p),
++      drain_additional_results(drain_additional_results_p) {
+ 	if (affected_rows != static_cast<idx_t>(-1)) {
+ 		this->exhausted = true;
+ 		return;
+@@ -88,14 +89,72 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
+ 
+ MySQLResult::~MySQLResult() {
+ 	bool stream_active = streaming == MySQLResultStreaming::ALLOW_STREAMING;
+-	if (stream_active && !exhausted) {
+-		TryCancelQuery();
++	try {
++		Finalize();
++	} catch (...) {
++		if (stream_active && !exhausted) {
++			TryCancelQuery();
++		}
+ 	}
+ 	if (stmt_lifetime == MySQLResultStatementLifetime::BORROWED) {
+ 		stmt.release();
+ 	}
+ }
+ 
++static void StoreDiscardedStatementResult(const string &query, MYSQL_STMT *stmt) {
++	bool btrue = true;
++	auto res_attr = mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue);
++	if (res_attr != 0) {
++		throw IOException("Failed to set STMT_ATTR_UPDATE_MAX_LENGTH for MySQL query \"%s\": %s\n", query.c_str(),
++		                  mysql_stmt_error(stmt));
++	}
++
++	int res_store = mysql_stmt_store_result(stmt);
++	if (res_store != 0) {
++		throw IOException("Failed to store result for MySQL query \"%s\": %s\n", query.c_str(),
++		                  mysql_stmt_error(stmt));
++	}
++}
++
++void MySQLResult::Finalize() {
++	if (drain_additional_results && !additional_results_drained) {
++		DrainRemainingResults();
++		additional_results_drained = true;
++	} else if (streaming == MySQLResultStreaming::ALLOW_STREAMING && !exhausted) {
++		TryCancelQuery();
++	}
++}
++
++void MySQLResult::DrainExtraResultSets() {
++	while (true) {
++		int next_result = mysql_stmt_next_result(stmt.get());
++		if (next_result < 0) {
++			return;
++		}
++		if (next_result > 0) {
++			throw IOException("Failed to fetch next result for MySQL query \"%s\": %s\n", query.c_str(),
++			                  mysql_stmt_error(stmt.get()));
++		}
++		if (mysql_stmt_field_count(stmt.get()) > 0) {
++			StoreDiscardedStatementResult(query, stmt.get());
++		}
++		mysql_stmt_free_result(stmt.get());
++	}
++}
++
++void MySQLResult::DrainRemainingResults() {
++	if (!stmt) {
++		return;
++	}
++	if (affected_rows == static_cast<idx_t>(-1)) {
++		while (!exhausted && FetchNext()) {
++		}
++		exhausted = true;
++		mysql_stmt_free_result(stmt.get());
++	}
++	DrainExtraResultSets();
++}
++
+ void MySQLResult::HandleTruncatedData() {
+ 	for (size_t i = 0; i < fields.size(); i++) {
+ 		MySQLField &f = fields[i];
+diff --git a/src/mysql_scanner.cpp b/src/mysql_scanner.cpp
+index fb62257..25e661d 100644
+--- a/src/mysql_scanner.cpp
++++ b/src/mysql_scanner.cpp
+@@ -35,6 +35,7 @@ struct MySQLGlobalState : public GlobalTableFunctionState {
+ 	}
+ 
+ 	~MySQLGlobalState() {
++		result.reset();
+ 		if (!pinned_connection) {
+ 			return;
+ 		}
+@@ -113,6 +114,7 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
+ 
+ 	while (true) {
+ 		if (gstate.result->Exhausted()) {
++			gstate.result->Finalize();
+ 			output.SetChildCardinality(0);
+ 			return;
+ 		}
+@@ -237,7 +239,7 @@ static vector<Value> ExtractParams(TableFunctionBindInput &input) {
+ 	return params;
+ }
+ 
+-static int64_t ExtractParamsHandle(TableFunctionBindInput &input) {
++static int64_t ExtractParamsHandle(TableFunctionBindInput &input, idx_t *params_count = nullptr) {
+ 	auto params_handle_it = input.named_parameters.find("params_handle");
+ 	if (params_handle_it != input.named_parameters.end()) {
+ 		Value &bigint_val = params_handle_it->second;
+@@ -249,6 +251,9 @@ static int64_t ExtractParamsHandle(TableFunctionBindInput &input) {
+ 		if (params_ptr.get() == nullptr) {
+ 			throw BinderException("Parameters not found, ID: %lld", params_handle);
+ 		}
++		if (params_count) {
++			*params_count = params_ptr->size();
++		}
+ 		MySQLParameterHandles::Add(std::move(params_ptr));
+ 		return params_handle;
+ 	}
+@@ -284,6 +289,40 @@ static uint64_t ExtractPinnedConnId(TableFunctionBindInput &input) {
+ 	return pinned_connection_id;
+ }
+ 
++static vector<string> ParseProcedureIdentifierParts(const string &procedure_name) {
++	auto parts = StringUtil::Split(procedure_name, '.');
++	if (parts.empty() || parts.size() > 2) {
++		throw BinderException("Procedure name must be either 'procedure' or 'schema.procedure'");
++	}
++	for (auto &part : parts) {
++		part = StringUtil::Trim(part);
++		if (part.empty()) {
++			throw BinderException("Procedure name must not contain empty identifiers");
++		}
++	}
++	return parts;
++}
++
++static string BuildProcedureCallQuery(const string &procedure_name, idx_t param_count) {
++	auto parts = ParseProcedureIdentifierParts(procedure_name);
++	string query = "CALL ";
++	for (idx_t i = 0; i < parts.size(); i++) {
++		if (i > 0) {
++			query += ".";
++		}
++		query += MySQLUtils::WriteIdentifier(parts[i]);
++	}
++	query += "(";
++	for (idx_t i = 0; i < param_count; i++) {
++		if (i > 0) {
++			query += ", ";
++		}
++		query += "?";
++	}
++	query += ")";
++	return query;
++}
++
+ static bool ExtractFlag(TableFunctionBindInput &input, const string &name, bool default_val) {
+ 	auto it = input.named_parameters.find(Identifier(name));
+ 	if (it != input.named_parameters.end()) {
+@@ -392,7 +431,7 @@ static unique_ptr<GlobalTableFunctionState> MySQLQueryInitGlobalState(ClientCont
+ 	return make_uniq<MySQLGlobalState>(std::move(pinned_connection));
+ }
+ 
+-static MySQLResultStreaming ResolveStreaming(MySQLQueryBindData &bdata) {
++static MySQLResultStreaming ResolveStreaming(MySQLQueryBindData &bdata, const string &function_name) {
+ 	if (bdata.prepared_stmt && bdata.optimizer_streaming == MySQLResultStreaming::ALLOW_STREAMING &&
+ 	    bdata.user_streaming != MySQLResultStreamingUser::FORCE_MATERIALIZATION) {
+ 		return MySQLResultStreaming::ALLOW_STREAMING;
+@@ -400,10 +439,11 @@ static MySQLResultStreaming ResolveStreaming(MySQLQueryBindData &bdata) {
+ 	if (bdata.optimizer_streaming != MySQLResultStreaming::ALLOW_STREAMING &&
+ 	    bdata.user_streaming == MySQLResultStreamingUser::REQUIRE_STREAMING) {
+ 		throw BinderException(
+-		    "Query result streaming requested in the 'mysql_query' function parameter cannot be performed due to "
++		    "Query result streaming requested in the '%s' function parameter cannot be performed due to "
+ 		    "multiple MySQL scans in the query."
+-		    "If streaming is required, consider using a separate attached catalog for each 'mysql_query' call - "
+-		    "will run on a separate connection without transcactional guarantees");
++		    "If streaming is required, consider using a separate attached catalog for each '%s' call - "
++		    "will run on a separate connection without transcactional guarantees",
++		    function_name, function_name);
+ 	}
+ 	if (!bdata.prepared_stmt && bdata.user_streaming == MySQLResultStreamingUser::REQUIRE_STREAMING) {
+ 		throw BinderException("Query result streaming cannot be used along with 'prepare=FALSE' option");
+@@ -449,7 +489,7 @@ static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, Dat
+ 	}
+ 
+ 	if (gstate.exec_state == MySQLQueryExecState::UNINITIALIZED) {
+-		MySQLResultStreaming result_streaming = ResolveStreaming(bdata);
++		MySQLResultStreaming result_streaming = ResolveStreaming(bdata, "mysql_query");
+ 		optional_ptr<MySQLConnection> conn_ptr = nullptr;
+ 		uint64_t current_connection_id = 0;
+ 		if (gstate.pinned_connection) {
+@@ -496,6 +536,145 @@ static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, Dat
+ 	MySQLScan(context, data, output);
+ }
+ 
++static unique_ptr<FunctionData> MySQLCallBind(ClientContext &context, TableFunctionBindInput &input,
++                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
++	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
++		throw BinderException("Parameters to mysql_call cannot be NULL");
++	}
++
++	string db_name = input.inputs[0].GetValue<string>();
++	MySQLCatalog &catalog = GetCatalogByName(context, db_name);
++	auto procedure_name = input.inputs[1].GetValue<string>();
++	vector<Value> params = ExtractParams(input);
++	idx_t params_count = params.size();
++	int64_t params_handle = ExtractParamsHandle(input, &params_count);
++	MySQLResultStreamingUser user_streaming = ExtractUserStreaming(input);
++	uint64_t pinned_connection_id = ExtractPinnedConnId(input);
++	auto sql = BuildProcedureCallQuery(procedure_name, params_count);
++
++	bool tran_restrict_dml = false;
++	try {
++		optional_ptr<MySQLConnection> conn_ptr = nullptr;
++		MySQLPooledConnection pinned_connection;
++		uint64_t prepare_connection_id = 0;
++		if (pinned_connection_id > 0) {
++			pinned_connection = catalog.GetConnectionPool().UnpinConnection(pinned_connection_id);
++			MySQLConnection &conn = pinned_connection.GetConnection();
++			conn_ptr = &conn;
++			prepare_connection_id = pinned_connection.Id();
++		} else {
++			MySQLTransaction &transaction = MySQLTransaction::Get(context, catalog);
++			MySQLConnection &conn = transaction.GetConnection();
++			conn_ptr = &conn;
++			prepare_connection_id = transaction.GetConnectionId();
++			tran_restrict_dml = transaction.GetAccessMode() == AccessMode::READ_ONLY;
++		}
++
++		auto deferred_pin = dbconnector::Defer([&pinned_connection, &catalog] {
++			if (!pinned_connection) {
++				return;
++			}
++			try {
++				catalog.GetConnectionPool().PinConnection(std::move(pinned_connection));
++			} catch (...) {
++				// suppress
++			}
++		});
++
++		MySQLConnection &conn = *conn_ptr;
++		auto stmt = conn.Prepare(sql);
++		if (stmt->Fields().size() > 0) {
++			for (auto &field : stmt->Fields()) {
++				names.push_back(Identifier(field.name));
++				return_types.push_back(field.duckdb_type);
++			}
++			QueryResult::DeduplicateColumns(names);
++		} else if (tran_restrict_dml) {
++			throw PermissionException(
++			    "statements that do not produce result sets cannot be run in a read-only connection");
++		} else {
++			return_types.emplace_back(LogicalType::BIGINT);
++			names.emplace_back("rowcount");
++		}
++
++		return make_uniq<MySQLQueryBindData>(catalog, sql, std::move(params), params_handle,
++		                                     std::move(stmt->FieldsCopy()), user_streaming, std::move(stmt),
++		                                     prepare_connection_id, pinned_connection_id);
++	} catch (const std::exception &ex) {
++		ErrorData error(ex);
++		throw BinderException("PREPARE error, procedure: \"%s\", message: \"%s\"", procedure_name,
++		                      error.RawMessage());
++	}
++}
++
++static void MySQLCallScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
++	auto &bdata = data.bind_data->CastNoConst<MySQLQueryBindData>();
++	auto &gstate = data.global_state->Cast<MySQLGlobalState>();
++
++	if (gstate.exec_state == MySQLQueryExecState::EXHAUSTED) {
++		output.SetChildCardinality(0);
++		return;
++	}
++
++	if (gstate.exec_state == MySQLQueryExecState::UNINITIALIZED) {
++		MySQLResultStreaming result_streaming = ResolveStreaming(bdata, "mysql_call");
++		optional_ptr<MySQLConnection> conn_ptr = nullptr;
++		uint64_t current_connection_id = 0;
++		if (gstate.pinned_connection) {
++			MySQLConnection &conn = gstate.pinned_connection.GetConnection();
++			conn_ptr = &conn;
++			current_connection_id = gstate.pinned_connection.Id();
++		} else {
++			auto attached_catalog = MySQLCatalog::Lookup(context, bdata.catalog_name);
++			MySQLCatalog &catalog = attached_catalog.Get<MySQLCatalog>();
++			auto &transaction = MySQLTransaction::Get(context, catalog);
++			MySQLConnection &conn = transaction.GetConnection();
++			conn_ptr = &conn;
++			current_connection_id = transaction.GetConnectionId();
++		}
++
++		MySQLConnection &conn = *conn_ptr;
++		const vector<Value> &params = ResolveParams(bdata, gstate);
++		try {
++			if (current_connection_id == bdata.prepare_connection_id) {
++				gstate.result = conn.QueryProcedureStmt(*bdata.prepared_stmt, params, result_streaming);
++			} else if (bdata.params_handle != 0) {
++				throw InvalidInputException(
++				    "MySQL connection is no longer available to reuse the prepared statement. Use 'params' option instead "
++				    "of 'params_handle' if re-preparing of the statement is acceptable.");
++			} else {
++				gstate.result = conn.QueryProcedure(bdata.query, params, result_streaming);
++			}
++		} catch (...) {
++			if (gstate.pinned_connection) {
++				gstate.pinned_connection.Invalidate();
++			}
++			throw;
++		}
++		gstate.exec_state = MySQLQueryExecState::EXECUTED;
++	}
++
++	if (bdata.fields.size() == 0) {
++		gstate.result->Finalize();
++		SetRowCount(output, gstate.result->AffectedRowsSigned());
++		gstate.exec_state = MySQLQueryExecState::EXHAUSTED;
++		return;
++	}
++
++	MySQLScan(context, data, output);
++}
++
++MySQLCallFunction::MySQLCallFunction()
++    : TableFunction("mysql_call", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLCallScan, MySQLCallBind,
++                    MySQLQueryInitGlobalState, MySQLInitLocalState) {
++	serialize = MySQLScanSerialize;
++	deserialize = MySQLScanDeserialize;
++	named_parameters["params"] = LogicalType::ANY;
++	named_parameters["params_handle"] = LogicalType::BIGINT;
++	named_parameters["stream_results"] = LogicalType::BOOLEAN;
++	named_parameters["connection"] = LogicalType::UBIGINT;
++}
++
+ MySQLQueryFunction::MySQLQueryFunction()
+     : TableFunction("mysql_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLQueryScan, MySQLQueryBind,
+                     MySQLQueryInitGlobalState, MySQLInitLocalState) {
+diff --git a/src/storage/mysql_catalog.cpp b/src/storage/mysql_catalog.cpp
+index c544aec..b3cef15 100644
+--- a/src/storage/mysql_catalog.cpp
++++ b/src/storage/mysql_catalog.cpp
+@@ -517,7 +517,7 @@ void MySQLCatalog::MaterializeMySQLScans(PhysicalOperator &op) {
+ 		if (MySQLCatalog::IsMySQLScan(function_name)) {
+ 			auto &bind_data = table_scan.bind_data->Cast<MySQLBindData>();
+ 			bind_data.optimizer_streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+-		} else if (MySQLCatalog::IsMySQLQuery(function_name)) {
++		} else if (MySQLCatalog::IsMySQLQuery(function_name) || MySQLCatalog::IsMySQLCall(function_name)) {
+ 			auto &bind_data = table_scan.bind_data->Cast<MySQLQueryBindData>();
+ 			bind_data.optimizer_streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+ 		}
+@@ -535,6 +535,10 @@ bool MySQLCatalog::IsMySQLQuery(const string &name) {
+ 	return name == "mysql_query";
+ }
+ 
++bool MySQLCatalog::IsMySQLCall(const string &name) {
++	return name == "mysql_call";
++}
++
+ DatabaseSize MySQLCatalog::GetDatabaseSize(ClientContext &context) {
+ 	if (default_schema.empty()) {
+ 		throw InvalidInputException("Attempting to fetch the database size - but no database was provided "
+diff --git a/src/storage/mysql_optimizer.cpp b/src/storage/mysql_optimizer.cpp
+index 3d654ba..3afef1a 100644
+--- a/src/storage/mysql_optimizer.cpp
++++ b/src/storage/mysql_optimizer.cpp
+@@ -23,7 +23,8 @@ void GatherMySQLScans(ClientContext &ctx, LogicalOperator &op, MySQLOperators &r
+ 			auto &bdata = get.bind_data->Cast<MySQLBindData>();
+ 			result.scans[bdata.table_name.Catalog().GetIdentifierName()].push_back(get);
+ 		}
+-		if (MySQLCatalog::IsMySQLQuery(table_scan.name.GetIdentifierName())) {
++		if (MySQLCatalog::IsMySQLQuery(table_scan.name.GetIdentifierName()) ||
++		    MySQLCatalog::IsMySQLCall(table_scan.name.GetIdentifierName())) {
+ 			auto &bdata = get.bind_data->Cast<MySQLQueryBindData>();
+ 			result.scans[bdata.catalog_name.GetIdentifierName()].push_back(get);
+ 		}
+@@ -50,7 +51,7 @@ void MySQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<Logical
+ 				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
+ 					bind_data.optimizer_streaming = result_streaming;
+ 				}
+-			} else if (MySQLCatalog::IsMySQLQuery(function_name)) {
++			} else if (MySQLCatalog::IsMySQLQuery(function_name) || MySQLCatalog::IsMySQLCall(function_name)) {
+ 				auto &bind_data = get.bind_data->Cast<MySQLQueryBindData>();
+ 				if (bind_data.optimizer_streaming == MySQLResultStreaming::UNINITIALIZED ||
+ 				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
