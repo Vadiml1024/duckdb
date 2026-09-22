@@ -662,6 +662,7 @@ static constexpr ExtensionFunctionEntry EXTENSION_FUNCTIONS[] = {
     {"mode", "core_functions", CatalogType::AGGREGATE_FUNCTION_ENTRY},
     {"murmur3_32", "ducklake", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"mysql_bind_params", "mysql_scanner", CatalogType::SCALAR_FUNCTION_ENTRY},
+    {"mysql_call", "mysql_scanner", CatalogType::TABLE_FUNCTION_ENTRY},
     {"mysql_clear_cache", "mysql_scanner", CatalogType::TABLE_FUNCTION_ENTRY},
     {"mysql_close_pinned_connection", "mysql_scanner", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"mysql_configure_pool", "mysql_scanner", CatalogType::TABLE_FUNCTION_ENTRY},
