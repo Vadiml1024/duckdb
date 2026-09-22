@@ -1,0 +1,579 @@
+diff --git a/README.md b/README.md
+index a7ea5cb..990ef3b 100644
+--- a/README.md
++++ b/README.md
+@@ -168,6 +168,24 @@ SELECT * FROM mysql_db.tmp;
+ 
+ > Note that DDL statements are not transactional in MySQL.
+ 
++## Calling Stored Procedures
++
++The extension also provides a `mysql_call` table function for remote stored procedures with `IN` parameters.
++
++```sql
++ATTACH 'host=localhost user=root port=0 database=mysqlscanner' AS mysql_db (TYPE mysql_scanner);
++
++SELECT *
++FROM mysql_call('mysql_db', 'report_sales', params := row(2026, 'US'));
++```
++
++Procedure names are identifier-quoted by the extension, and parameter values are always sent through prepared
++statement bindings.
++
++`mysql_call` returns the first result produced by the remote procedure. If the procedure does not produce a row
++set, the function returns a single `rowcount BIGINT` column instead. Any remaining result sets are drained before
++the connection is reused. `OUT` and `INOUT` parameters are not supported.
++
+ ## Settings
+ |                name                |                          description                           | default |
+ |------------------------------------|----------------------------------------------------------------|---------|
+diff --git a/src/include/mysql_result.hpp b/src/include/mysql_result.hpp
+index e5f4f37..533cf82 100644
+--- a/src/include/mysql_result.hpp
++++ b/src/include/mysql_result.hpp
+@@ -28,7 +28,8 @@ enum struct MySQLResultStatementLifetime { OWNED, BORROWED };
+ class MySQLResult {
+ public:
+ 	MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+-	            const string &connection_string_p, unsigned long connection_id_p, MySQLResultStreaming streaming_p,
++	            optional_ptr<MySQLConnection> owner_connection_p, const string &connection_string_p,
++	            unsigned long connection_id_p, MySQLResultStreaming streaming_p,
+ 	            idx_t affected_rows_p, vector<MySQLField> fields_p = vector<MySQLField>(),
+ 	            MySQLResultStatementLifetime stmt_lifetime_p = MySQLResultStatementLifetime::OWNED);
+ 
+@@ -45,11 +46,14 @@ public:
+ 	idx_t AffectedRows();
+ 	int64_t AffectedRowsSigned();
+ 	const vector<MySQLField> &Fields();
++	void DrainRemainingResults();
++	void Finalize();
+ 
+ private:
+ 	string query;
+ 	MySQLStatementPtr stmt;
+ 	MySQLTypeConfig type_config;
++	optional_ptr<MySQLConnection> owner_connection;
+ 	string connection_string;
+ 	unsigned long connection_id;
+ 	MySQLResultStreaming streaming;
+@@ -62,6 +66,7 @@ private:
+ 	DataChunk data_chunk;
+ 	idx_t row_idx = static_cast<idx_t>(-1);
+ 	bool exhausted = false;
++	bool cleanup_complete = false;
+ 
+ 	bool FetchNext();
+ 	void HandleTruncatedData();
+@@ -70,6 +75,10 @@ private:
+ 	void CheckNotNull(idx_t col);
+ 	void CheckType(idx_t col, LogicalTypeId type_id);
+ 	bool TryCancelQuery();
++	void InitializeCurrentResult(vector<MySQLField> fields_p = vector<MySQLField>());
++	bool AdvanceToNextResult();
++	void DrainFollowingResults();
++	void InvalidateConnection();
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/mysql_scanner.hpp b/src/include/mysql_scanner.hpp
+index 48a5482..fbab737 100644
+--- a/src/include/mysql_scanner.hpp
++++ b/src/include/mysql_scanner.hpp
+@@ -97,6 +97,11 @@ public:
+ 	MySQLQueryFunction();
+ };
+ 
++class MySQLCallFunction : public TableFunction {
++public:
++	MySQLCallFunction();
++};
++
+ class MySQLClearCacheFunction : public TableFunction {
+ public:
+ 	MySQLClearCacheFunction();
+diff --git a/src/include/storage/mysql_catalog.hpp b/src/include/storage/mysql_catalog.hpp
+index cad8ae8..9890d83 100644
+--- a/src/include/storage/mysql_catalog.hpp
++++ b/src/include/storage/mysql_catalog.hpp
+@@ -89,6 +89,7 @@ public:
+ 	static void MaterializeMySQLScans(PhysicalOperator &op);
+ 	static bool IsMySQLScan(const string &name);
+ 	static bool IsMySQLQuery(const string &name);
++	static bool IsMySQLCall(const string &name);
+ 
+ 	static dbconnector::attached::AttachedCatalog Lookup(ClientContext &ctx, const Identifier &name);
+ 
+diff --git a/src/mysql_connection.cpp b/src/mysql_connection.cpp
+index e32e0d7..5199b8b 100644
+--- a/src/mysql_connection.cpp
++++ b/src/mysql_connection.cpp
+@@ -139,8 +139,8 @@ unique_ptr<MySQLResult> MySQLConnection::QueryInternal(const string &query, cons
+ 
+ 	idx_t affected_rows = MySQLExecute(stmt.get(), query, params, result_streaming);
+ 	unsigned long connection_id = connection->GetID();
+-	return make_uniq<MySQLResult>(query, std::move(stmt), type_config, connection_string, connection_id, streaming,
+-	                              affected_rows);
++	return make_uniq<MySQLResult>(query, std::move(stmt), type_config, this, connection_string, connection_id,
++	                              streaming, affected_rows);
+ }
+ 
+ unique_ptr<MySQLResult> MySQLConnection::Query(const string &query, MySQLResultStreaming streaming) {
+@@ -162,8 +162,9 @@ unique_ptr<MySQLResult> MySQLConnection::QueryStmt(MySQLStatement &stmt, const v
+ 	// owning pointer here only because it is required by result interface, stmt won't be destroyed
+ 	MySQLStatementPtr stmt_ptr(stmt_ptr_bare, MySQLStatementDelete);
+ 	unsigned long connection_id = connection->GetID();
+-	return make_uniq<MySQLResult>(stmt.Query(), std::move(stmt_ptr), type_config, connection_string, connection_id,
+-	                              streaming, affected_rows, stmt.FieldsCopy(), MySQLResultStatementLifetime::BORROWED);
++	return make_uniq<MySQLResult>(stmt.Query(), std::move(stmt_ptr), type_config, this, connection_string,
++	                              connection_id, streaming, affected_rows, stmt.FieldsCopy(),
++	                              MySQLResultStatementLifetime::BORROWED);
+ }
+ 
+ unique_ptr<MySQLStatement> MySQLConnection::Prepare(const string &query) {
+diff --git a/src/mysql_extension.cpp b/src/mysql_extension.cpp
+index bce34a3..88de960 100644
+--- a/src/mysql_extension.cpp
++++ b/src/mysql_extension.cpp
+@@ -126,6 +126,9 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	MySQLQueryFunction query_function;
+ 	loader.RegisterFunction(query_function);
+ 
++	MySQLCallFunction call_function;
++	loader.RegisterFunction(call_function);
++
+ 	MySQLPinConnectionFunction pin_connection_function;
+ 	loader.RegisterFunction(pin_connection_function);
+ 
+diff --git a/src/mysql_result.cpp b/src/mysql_result.cpp
+index f8d8295..f4f641b 100644
+--- a/src/mysql_result.cpp
++++ b/src/mysql_result.cpp
+@@ -55,14 +55,23 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
+ }
+ 
+ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+-                         const string &connection_string_p, unsigned long connection_id_p,
++                         optional_ptr<MySQLConnection> owner_connection_p, const string &connection_string_p,
++                         unsigned long connection_id_p,
+                          MySQLResultStreaming streaming_p, idx_t affected_rows_p, vector<MySQLField> fields_p,
+                          MySQLResultStatementLifetime stmt_lifetime_p)
+     : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)),
+-      connection_string(connection_string_p), connection_id(connection_id_p), streaming(streaming_p),
++      owner_connection(owner_connection_p), connection_string(connection_string_p), connection_id(connection_id_p),
++      streaming(streaming_p),
+       affected_rows(affected_rows_p), fields(std::move(fields_p)), stmt_lifetime(stmt_lifetime_p) {
++	InitializeCurrentResult(std::move(fields));
++}
++
++void MySQLResult::InitializeCurrentResult(vector<MySQLField> fields_p) {
++	fields = std::move(fields_p);
++	affected_rows = mysql_stmt_affected_rows(stmt.get());
++	data_chunk = DataChunk();
++	row_idx = static_cast<idx_t>(-1);
+ 	if (affected_rows != static_cast<idx_t>(-1)) {
+-		this->exhausted = true;
+ 		return;
+ 	}
+ 	if (this->fields.empty()) {
+@@ -87,12 +96,74 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
+ }
+ 
+ MySQLResult::~MySQLResult() {
++	Finalize();
++	if (stmt_lifetime == MySQLResultStatementLifetime::BORROWED) {
++		stmt.release();
++	}
++}
++
++void MySQLResult::InvalidateConnection() {
++	if (owner_connection) {
++		owner_connection->Close();
++	}
++	exhausted = true;
++	cleanup_complete = true;
++}
++
++bool MySQLResult::AdvanceToNextResult() {
++	mysql_stmt_free_result(stmt.get());
++	auto next_result = mysql_stmt_next_result(stmt.get());
++	if (next_result == 0) {
++		InitializeCurrentResult();
++		return true;
++	}
++	if (next_result == MYSQL_NO_DATA) {
++		return false;
++	}
++	throw IOException("Failed to advance to next result for MySQL query \"%s\": %s\n", query.c_str(),
++	                  mysql_stmt_error(stmt.get()));
++}
++
++void MySQLResult::DrainFollowingResults() {
++	while (AdvanceToNextResult()) {
++		if (affected_rows == static_cast<idx_t>(-1)) {
++			while (FetchNext()) {
++			}
++		}
++	}
++	cleanup_complete = true;
++}
++
++void MySQLResult::DrainRemainingResults() {
++	if (cleanup_complete) {
++		return;
++	}
++	try {
++		if (affected_rows == static_cast<idx_t>(-1) && !exhausted) {
++			while (FetchNext()) {
++			}
++			exhausted = true;
++		}
++		DrainFollowingResults();
++	} catch (...) {
++		InvalidateConnection();
++		throw;
++	}
++}
++
++void MySQLResult::Finalize() {
++	if (cleanup_complete) {
++		return;
++	}
+ 	bool stream_active = streaming == MySQLResultStreaming::ALLOW_STREAMING;
+ 	if (stream_active && !exhausted) {
+ 		TryCancelQuery();
++		InvalidateConnection();
++		return;
+ 	}
+-	if (stmt_lifetime == MySQLResultStatementLifetime::BORROWED) {
+-		stmt.release();
++	try {
++		DrainRemainingResults();
++	} catch (...) {
+ 	}
+ }
+ 
+@@ -130,6 +201,7 @@ DataChunk &MySQLResult::NextChunk() {
+ 	for (; r < STANDARD_VECTOR_SIZE; r++) {
+ 		if (!FetchNext()) {
+ 			this->exhausted = true;
++			DrainFollowingResults();
+ 			break;
+ 		}
+ 
+diff --git a/src/mysql_scanner.cpp b/src/mysql_scanner.cpp
+index fb62257..711ab6d 100644
+--- a/src/mysql_scanner.cpp
++++ b/src/mysql_scanner.cpp
+@@ -295,6 +295,36 @@ static bool ExtractFlag(TableFunctionBindInput &input, const string &name, bool
+ 	return default_val;
+ }
+ 
++static QualifiedName ExtractProcedureName(const Value &value) {
++	auto procedure_name = value.GetValue<string>();
++	auto qualified_name = QualifiedName::Parse(procedure_name);
++	if (qualified_name.Name().empty()) {
++		throw BinderException("Procedure name cannot be empty");
++	}
++	if (!qualified_name.Catalog().empty() || qualified_name.Path().size() > 2) {
++		throw BinderException("Procedure name must be unqualified or schema-qualified");
++	}
++	return qualified_name;
++}
++
++static string CreateCallQuery(const QualifiedName &procedure_name, idx_t param_count) {
++	string query = "CALL ";
++	if (!procedure_name.Schema().empty()) {
++		query += MySQLUtils::WriteIdentifier(procedure_name.Schema().GetIdentifierName());
++		query += ".";
++	}
++	query += MySQLUtils::WriteIdentifier(procedure_name.Name().GetIdentifierName());
++	query += "(";
++	for (idx_t i = 0; i < param_count; i++) {
++		if (i > 0) {
++			query += ", ";
++		}
++		query += "?";
++	}
++	query += ")";
++	return query;
++}
++
+ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
+ 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+@@ -380,6 +410,75 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
+ 	}
+ }
+ 
++static unique_ptr<FunctionData> MySQLCallBind(ClientContext &context, TableFunctionBindInput &input,
++                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
++	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
++		throw BinderException("Parameters to mysql_call cannot be NULL");
++	}
++
++	string db_name = input.inputs[0].GetValue<string>();
++	MySQLCatalog &catalog = GetCatalogByName(context, db_name);
++	auto procedure_name = ExtractProcedureName(input.inputs[1]);
++	vector<Value> params = ExtractParams(input);
++	uint64_t pinned_connection_id = ExtractPinnedConnId(input);
++	auto query = CreateCallQuery(procedure_name, params.size());
++
++	bool tran_restrict_dml = false;
++	try {
++		optional_ptr<MySQLConnection> conn_ptr = nullptr;
++		MySQLPooledConnection pinned_connection;
++		uint64_t prepare_connection_id = 0;
++		if (pinned_connection_id > 0) {
++			pinned_connection = catalog.GetConnectionPool().UnpinConnection(pinned_connection_id);
++			MySQLConnection &conn = pinned_connection.GetConnection();
++			conn_ptr = &conn;
++			prepare_connection_id = pinned_connection.Id();
++		} else {
++			MySQLTransaction &transaction = MySQLTransaction::Get(context, catalog);
++			MySQLConnection &conn = transaction.GetConnection();
++			conn_ptr = &conn;
++			prepare_connection_id = transaction.GetConnectionId();
++			tran_restrict_dml = transaction.GetAccessMode() == AccessMode::READ_ONLY;
++		}
++
++		auto deferred_pin = dbconnector::Defer([&pinned_connection, &catalog] {
++			if (!pinned_connection) {
++				return;
++			}
++			try {
++				catalog.GetConnectionPool().PinConnection(std::move(pinned_connection));
++			} catch (...) {
++				// suppress
++			}
++		});
++
++		MySQLConnection &conn = *conn_ptr;
++		unique_ptr<MySQLStatement> stmt = conn.Prepare(query);
++		if (stmt->Fields().size() > 0) {
++			for (auto &field : stmt->Fields()) {
++				names.push_back(Identifier(field.name));
++				return_types.push_back(field.duckdb_type);
++			}
++		} else if (tran_restrict_dml) {
++			throw PermissionException("stored procedures that do not produce result sets cannot be run in a read-only "
++			                          "connection");
++		} else {
++			return_types.emplace_back(LogicalType::BIGINT);
++			names.emplace_back("rowcount");
++		}
++
++		QueryResult::DeduplicateColumns(names);
++
++		return make_uniq<MySQLQueryBindData>(catalog, query, std::move(params), 0, std::move(stmt->FieldsCopy()),
++		                                     MySQLResultStreamingUser::UNINITIALIZED, std::move(stmt),
++		                                     prepare_connection_id, pinned_connection_id);
++	} catch (const std::exception &ex) {
++		ErrorData error(ex);
++		throw BinderException("PREPARE error, procedure: \"%s\", message: \"%s\"", procedure_name.ToString(),
++		                      error.RawMessage());
++	}
++}
++
+ static unique_ptr<GlobalTableFunctionState> MySQLQueryInitGlobalState(ClientContext &ctx,
+                                                                       TableFunctionInitInput &input) {
+ 	auto &bdata = input.bind_data->CastNoConst<MySQLQueryBindData>();
+@@ -488,7 +587,9 @@ static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, Dat
+ 	}
+ 
+ 	if (bdata.fields.size() == 0) {
+-		SetRowCount(output, gstate.result->AffectedRowsSigned());
++		auto row_count = gstate.result->AffectedRowsSigned();
++		gstate.result->DrainRemainingResults();
++		SetRowCount(output, row_count);
+ 		gstate.exec_state = MySQLQueryExecState::EXHAUSTED;
+ 		return;
+ 	}
+@@ -509,6 +610,15 @@ MySQLQueryFunction::MySQLQueryFunction()
+ 	named_parameters["suppress_dml_output"] = LogicalType::BOOLEAN;
+ }
+ 
++MySQLCallFunction::MySQLCallFunction()
++    : TableFunction("mysql_call", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLQueryScan, MySQLCallBind,
++                    MySQLQueryInitGlobalState, MySQLInitLocalState) {
++	serialize = MySQLScanSerialize;
++	deserialize = MySQLScanDeserialize;
++	named_parameters["params"] = LogicalType::ANY;
++	named_parameters["connection"] = LogicalType::UBIGINT;
++}
++
+ MySQLExecuteFunction::MySQLExecuteFunction()
+     : TableFunction("mysql_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLQueryScan, MySQLQueryBind,
+                     MySQLQueryInitGlobalState, MySQLInitLocalState) {
+diff --git a/src/storage/mysql_catalog.cpp b/src/storage/mysql_catalog.cpp
+index c544aec..b3cef15 100644
+--- a/src/storage/mysql_catalog.cpp
++++ b/src/storage/mysql_catalog.cpp
+@@ -517,7 +517,7 @@ void MySQLCatalog::MaterializeMySQLScans(PhysicalOperator &op) {
+ 		if (MySQLCatalog::IsMySQLScan(function_name)) {
+ 			auto &bind_data = table_scan.bind_data->Cast<MySQLBindData>();
+ 			bind_data.optimizer_streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+-		} else if (MySQLCatalog::IsMySQLQuery(function_name)) {
++		} else if (MySQLCatalog::IsMySQLQuery(function_name) || MySQLCatalog::IsMySQLCall(function_name)) {
+ 			auto &bind_data = table_scan.bind_data->Cast<MySQLQueryBindData>();
+ 			bind_data.optimizer_streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+ 		}
+@@ -535,6 +535,10 @@ bool MySQLCatalog::IsMySQLQuery(const string &name) {
+ 	return name == "mysql_query";
+ }
+ 
++bool MySQLCatalog::IsMySQLCall(const string &name) {
++	return name == "mysql_call";
++}
++
+ DatabaseSize MySQLCatalog::GetDatabaseSize(ClientContext &context) {
+ 	if (default_schema.empty()) {
+ 		throw InvalidInputException("Attempting to fetch the database size - but no database was provided "
+diff --git a/src/storage/mysql_optimizer.cpp b/src/storage/mysql_optimizer.cpp
+index 3d654ba..3afef1a 100644
+--- a/src/storage/mysql_optimizer.cpp
++++ b/src/storage/mysql_optimizer.cpp
+@@ -23,7 +23,8 @@ void GatherMySQLScans(ClientContext &ctx, LogicalOperator &op, MySQLOperators &r
+ 			auto &bdata = get.bind_data->Cast<MySQLBindData>();
+ 			result.scans[bdata.table_name.Catalog().GetIdentifierName()].push_back(get);
+ 		}
+-		if (MySQLCatalog::IsMySQLQuery(table_scan.name.GetIdentifierName())) {
++		if (MySQLCatalog::IsMySQLQuery(table_scan.name.GetIdentifierName()) ||
++		    MySQLCatalog::IsMySQLCall(table_scan.name.GetIdentifierName())) {
+ 			auto &bdata = get.bind_data->Cast<MySQLQueryBindData>();
+ 			result.scans[bdata.catalog_name.GetIdentifierName()].push_back(get);
+ 		}
+@@ -50,7 +51,7 @@ void MySQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<Logical
+ 				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
+ 					bind_data.optimizer_streaming = result_streaming;
+ 				}
+-			} else if (MySQLCatalog::IsMySQLQuery(function_name)) {
++			} else if (MySQLCatalog::IsMySQLQuery(function_name) || MySQLCatalog::IsMySQLCall(function_name)) {
+ 				auto &bind_data = get.bind_data->Cast<MySQLQueryBindData>();
+ 				if (bind_data.optimizer_streaming == MySQLResultStreaming::UNINITIALIZED ||
+ 				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
+diff --git a/test/sql/mysql_call.test b/test/sql/mysql_call.test
+new file mode 100644
+index 0000000..bcbe35a
+--- /dev/null
++++ b/test/sql/mysql_call.test
+@@ -0,0 +1,120 @@
++# name: test/sql/mysql_call.test
++# description: Test mysql_call
++# group: [sql]
++
++require mysql_scanner
++
++require-env MYSQL_TEST_DATABASE_AVAILABLE
++
++statement ok
++ATTACH 'host=localhost user=root port=0 database=mysqlscanner' AS s (TYPE MYSQL_SCANNER)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_no_args', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_args', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_multi', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_no_result', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_error', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP TABLE IF EXISTS duckdb_proc_state', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE TABLE duckdb_proc_state(cnt INTEGER)', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'INSERT INTO duckdb_proc_state VALUES (0)', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_no_args() SELECT 42 AS answer', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_args(IN p_year INT, IN p_region VARCHAR(20)) SELECT p_year AS sales_year, p_region AS region_name', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_multi() BEGIN SELECT ''first'' AS result_tag; SELECT ''second'' AS ignored_result; END', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_no_result() UPDATE duckdb_proc_state SET cnt = cnt + 1', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_error() SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''duckdb_proc_error''', prepare=FALSE)
++
++query I
++FROM mysql_call('s', 'duckdb_proc_no_args')
++----
++42
++
++query II
++FROM mysql_call('s', 'duckdb_proc_args', params=row(2026, 'US'))
++----
++2026	US
++
++query I
++FROM mysql_call('s', 'duckdb_proc_multi')
++----
++first
++
++query I
++FROM mysql_query('s', 'SELECT 99')
++----
++99
++
++query I
++FROM mysql_call('s', 'duckdb_proc_no_result')
++----
++1
++
++query I
++FROM mysql_query('s', 'SELECT cnt FROM duckdb_proc_state')
++----
++1
++
++statement error
++FROM mysql_call('s', 'duckdb_proc_args', params=row(2026))
++----
++Incorrect query parameters count specified
++
++statement error
++FROM mysql_call('s', 'duckdb_missing_proc')
++----
++<REGEX>:.*duckdb_missing_proc.*
++
++statement error
++FROM mysql_call('s', 'duckdb_proc_error')
++----
++<REGEX>:.*duckdb_proc_error.*
++
++query I
++FROM mysql_query('s', 'SELECT 7')
++----
++7
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_error', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_no_result', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_multi', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_args', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_no_args', prepare=FALSE)
++
++statement ok
++CALL mysql_execute('s', 'DROP TABLE duckdb_proc_state', prepare=FALSE)
++
++statement ok
++DETACH s
