@@ -1,8 +1,10 @@
-# Plan: Add Remote MySQL Procedure and Function Calls
+# Plan: Add Remote MySQL Stored Procedure Calls
 
 ## 1. Scope and current state
 
-The MySQL extension currently supports attaching remote MySQL databases, scanning remote tables, executing raw SQL, and clearing its cache. It does not provide a dedicated API for invoking remote stored procedures, including procedures that return result sets or use `OUT`/`INOUT` parameters.
+The MySQL extension currently supports attaching remote MySQL databases, scanning remote tables, executing raw SQL, and clearing its cache. It does not provide a dedicated API for invoking remote stored procedures, including procedures that return result sets.
+
+This plan intentionally narrows the scope to remote stored procedures, not remote scalar functions in general. The extension already exposes raw SQL execution through `mysql_query`, which can be used for expressions like `SELECT my_function(?)` or `SELECT * FROM mysql_query('db', 'SELECT my_function(?)', params=row(...))`. If a dedicated function wrapper is needed later, it should be justified by a concrete ergonomic or metadata need.
 
 The implementation should target the separate MySQL extension repository/source tree used by DuckDB, especially:
 
@@ -13,236 +15,241 @@ The implementation should target the separate MySQL extension repository/source 
 - `src/mysql_parameter.cpp`
 - `src/include/mysql_statement.hpp`
 - `src/storage/mysql_connection_pool.*`
-- SQL tests and `README.md`
+- `src/storage/mysql_optimizer.cpp`
+- `src/CMakeLists.txt`
+- SQL tests under `test/sql/`
+- `README.md`
 
 ## 2. Goals
 
-1. Provide a safe DuckDB-facing API for calling remote MySQL stored procedures.
+1. Add a safe DuckDB-facing API for invoking remote MySQL stored procedures.
 2. Support `IN` parameters using prepared statements and parameter binding.
-3. Support procedures that return one or more result sets.
-4. Support `OUT` and `INOUT` parameters, initially using connection-local session variables if native connector support is insufficient.
-5. Preserve connection-pool correctness by keeping the complete call and output-parameter retrieval sequence on one pinned connection.
-6. Provide clear errors for missing procedures, invalid argument counts, unsupported output shapes, and remote MySQL errors.
+3. Support procedures that return a result set.
+4. Ensure the remote result stream is fully consumed before a pooled connection is returned.
+5. Preserve connection-pool correctness by keeping the complete `CALL` + result-draining sequence on one pinned connection.
+6. Return clear errors for missing procedures, invalid argument counts, unsupported output shapes, and remote MySQL errors.
 7. Document the feature and cover it with integration tests.
 
 ## 3. Proposed SQL interface
 
-Start with a table-function interface so the feature can be implemented entirely in the extension without changing DuckDB's SQL parser:
+Initial public API: extension table function, not native DuckDB `CALL` integration.
 
 ```sql
 ATTACH 'host=... user=... password=... database=...' AS mysql_db (TYPE mysql);
 
 SELECT *
-FROM mysql_call('mysql_db', 'report_sales', 2026, 'US');
+FROM mysql_call('mysql_db', 'report_sales', params := row(2026, 'US'));
 ```
 
-The first version should support a procedure name and positional values. A later version may add explicit parameter metadata or named parameters.
-
-Remote scalar functions already fit naturally through a remote query such as:
+Alternative accepted variant if the function is designed like `mysql_query`:
 
 ```sql
 SELECT *
-FROM mysql_query('mysql_db', 'SELECT my_function(?)', [42]);
+FROM mysql_call('mysql_db', 'report_sales', params = row(2026, 'US'));
 ```
 
-Therefore, first verify whether a dedicated function wrapper is actually needed. Avoid adding a second API unless it provides capabilities that `mysql_query` cannot provide.
+The exact argument pattern should be finalized during implementation, but it must keep the same properties as the existing extension APIs:
+
+- parameter values must be passed as a `STRUCT`/`ROW` list, not as string concatenation;
+- the catalog/attached database name is explicit;
+- the procedure name is explicit and identifier-safe;
+- the API remains inside the extension, with no parser/core changes.
+
+For scalar functions, the recommended path remains:
+
+```sql
+SELECT *
+FROM mysql_query('mysql_db', 'SELECT my_function(?)', params := row(42));
+```
+
+This is already consistent with the extension's approach to remote SQL execution. A dedicated `mysql_function` wrapper should be added only if it provides real value beyond the `mysql_query` based pattern.
 
 ## 4. Design comparison: `mysql_call` versus native DuckDB `CALL`
 
 ### 4.1 Native DuckDB `CALL`
 
-Native DuckDB `CALL` is the natural SQL syntax for invoking a procedure registered in DuckDB's catalog. It gives users a concise statement form and allows DuckDB to resolve the procedure, bind arguments, plan execution, and report errors using its normal procedure infrastructure:
+Native DuckDB `CALL` is the natural SQL syntax for invoking a procedure registered in DuckDB's catalog:
 
 ```sql
 CALL local_procedure(2026, 'US');
 ```
 
-However, native `CALL` is not automatically a remote execution mechanism. A MySQL procedure is owned by the remote server, uses MySQL's procedure and parameter semantics, and may return MySQL-specific result sets or `OUT`/`INOUT` values. Supporting direct syntax such as:
+This is a good fit for local procedures that are part of DuckDB's catalog, binder, and planner. However, it is not automatically the right mechanism for a remote MySQL procedure, because a MySQL procedure is not a local DuckDB procedure and has MySQL-specific semantics around:
+
+- parameter modes (`IN`, `OUT`, `INOUT`);
+- multi-result procedures;
+- result-set cardinality;
+- remote transaction behavior;
+- server-specific metadata.
+
+A direct remote invocation such as:
 
 ```sql
 CALL mysql_db.report_sales(2026, 'US');
 ```
 
-would therefore require integration with DuckDB's parser, binder, catalog, planner, execution engine, and extension API. It would also require defining how a remote catalog entry maps to DuckDB's procedure abstraction and how remote result-set behavior maps to DuckDB's single statement result.
+would require remote catalog registration or a special remote-call path in the planner. That is a bigger and higher-risk design than the extension-native API.
 
 ### 4.2 Extension table function: `mysql_call`
 
-The proposed MVP uses an extension table function:
+The extension-native approach is:
 
 ```sql
 SELECT *
-FROM mysql_call('mysql_db', 'report_sales', 2026, 'US');
+FROM mysql_call('mysql_db', 'report_sales', params := row(2026, 'US'));
 ```
 
-This approach has several advantages:
+Advantages:
 
-- it requires no DuckDB core parser changes;
-- it can be implemented and released in the MySQL extension;
-- it naturally exposes a procedure's tabular result set;
-- it can reuse the existing `mysql_query` table-function, connection-pool, prepared-statement, and result-streaming patterns;
-- it makes the remote catalog and procedure name explicit;
-- it allows the extension to define MySQL-specific handling for multiple result sets and output parameters.
+- no DuckDB core parser changes;
+- no new core procedure contract is required;
+- the feature remains inside the MySQL extension;
+- result-set handling is explicitly defined by the extension;
+- it can reuse the existing `mysql_query`, connection-pool, prepared-statement, and result-streaming architecture;
+- it keeps remote catalog and procedure names explicit;
+- it is low-risk and additive.
 
-The main disadvantages are more verbose syntax and less integration with native DuckDB procedure discovery, autocomplete, and procedure metadata.
+Disadvantages:
+
+- it is more verbose than native `CALL`;
+- it does not integrate with DuckDB's native procedure metadata/autocomplete model;
+- it cannot naturally express a remote procedure call with the same ergonomics as a local DuckDB procedure.
 
 ### 4.3 Recommended staged approach
 
-Use `mysql_call` as the initial public API and keep native `CALL` syntax as a possible follow-up enhancement:
+Use `mysql_call` as the initial public API and treat native `CALL` integration as a later enhancement only if there is a clear need.
 
 | Concern | `mysql_call` table function | Native DuckDB `CALL` integration |
 | --- | --- | --- |
-| Implementation location | MySQL extension only | DuckDB core plus MySQL extension |
-| Parser changes | None | Required for remote catalog-qualified calls, unless existing syntax is reusable |
-| Result-set handling | Explicitly designed by the extension | Must fit DuckDB procedure result semantics |
-| MySQL `OUT`/`INOUT` | Can expose extension-specific behavior | Requires a general DuckDB procedure contract or adapter |
-| Multiple result sets | Can define first-result or selector policy | Needs a core-level representation or truncation policy |
-| Security boundary | Explicit remote catalog and identifier handling | More implicit after catalog registration |
-| Backward compatibility | Low risk, additive extension API | Higher risk because parser/binder behavior changes |
-| User ergonomics | More verbose | More familiar SQL syntax |
-| Portability | Works with MySQL-extension versions independently | Tied to DuckDB core and extension API versions |
+| Implementation location | MySQL extension only | DuckDB core + extension integration |
+| Parser changes | None | Required for dotted remote procedure syntax |
+| Result-set handling | Explicitly designed in the extension | Must fit a general DuckDB procedure contract |
+| `OUT` / `INOUT` handling | Extension-specific API contract | Requires core-level representation and binder semantics |
+| Multi-result sets | Can define a first-result policy | Needs a core-level representation or a truncation policy |
+| Security boundary | Explicit remote catalog and procedure names | More implicit after catalog registration |
+| Backward compatibility | Low risk and additive | Higher risk and more invasive |
+| User ergonomics | More verbose | More concise |
 
-### 4.4 When native `CALL` becomes worthwhile
+### 4.4 Decision
 
-Consider native syntax only after the extension table function has established stable semantics for:
-
-1. remote procedure name resolution;
-2. input parameter conversion and prepared binding;
-3. connection pinning;
-4. output-parameter representation;
-5. first and subsequent result-set behavior;
-6. error and transaction handling.
-
-A later native integration could register remote procedures dynamically or add a remote procedure catalog entry that delegates execution to the MySQL extension. The adapter should still preserve the explicit remote catalog association and should not hide whether a procedure executes locally or remotely.
-
-A possible future syntax is:
-
-```sql
-CALL mysql_db.report_sales(2026, 'US');
-```
-
-but this should not be committed until the following questions are answered:
-
-- Does `mysql_db.report_sales` resolve as a DuckDB catalog procedure or as a special remote-call expression?
-- How are procedures discovered and refreshed from `information_schema.PARAMETERS`?
-- How are `OUT` and `INOUT` values returned to the caller?
-- What happens when a procedure emits multiple result sets?
-- Can native `CALL` participate in DuckDB transactions, or is the remote transaction boundary independent?
-- How are remote MySQL and local DuckDB type systems reconciled?
-
-### 4.5 Decision
-
-For the MVP, implement `mysql_call` as an extension table function. Document that it is the supported remote-procedure API and that `mysql_query` remains the supported escape hatch for scalar MySQL functions and arbitrary remote SQL. Revisit native `CALL` only after the remote execution contract is stable and there is a concrete need for catalog integration or more concise syntax.
+The MVP will use `mysql_call` as the supported remote procedure API. The extension should continue using `mysql_query` for scalar function calls and arbitrary remote SQL. Native DuckDB `CALL` syntax remains a future enhancement for later catalog integration, not part of the first implementation.
 
 ## 5. Architecture
 
 ### 5.1 Add procedure-call bind and execution state
 
-Add a `MySQLCallFunction` table function and corresponding bind data, following the patterns used by `MySQLQueryFunction` and `MySQLQueryBindData`.
+Add a `MySQLCallFunction` table function and `MySQLCallBindData`, modeled on `MySQLQueryFunction` and `MySQLQueryBindData`.
 
-The bind data should contain at least:
+Required bind data fields:
 
 - attached catalog name
-- validated and safely quoted procedure identifier
+- procedure identifier, safely quoted or validated
 - input parameter values
-- output-parameter descriptors
+- parameter-count/metadata contract (initially `IN` only)
 - selected result-set policy
-- prepared-statement metadata, if preparation occurs during bind
+- prepared-statement metadata if the query is prepared during bind
 
-The execution state should own or pin the connection for the complete operation and retain the current result set while rows are streamed to DuckDB.
+The execution state must pin the connection for the complete remote call and keep the underlying result object alive until all rows are drained or an error occurs.
 
-### 5.2 Add multi-result handling
+### 5.2 Multi-result handling
 
-A MySQL procedure can produce multiple results. Extend the connector/result abstraction to:
+Stored procedures can emit more than one result set. The initial MVP must define a single, stable contract:
 
-1. execute the `CALL` statement;
-2. expose the current result set;
-3. iterate through subsequent results using the MariaDB/MySQL client API;
-4. drain every remaining result before returning the connection to the pool;
-5. preserve the first result set for the initial table-function implementation.
+- if the procedure returns a row-producing result set, return that result set;
+- if it does not, return a single `rowcount BIGINT` result or an explicit empty result as defined by the function contract;
+- if it returns multiple result sets, only the first result set is surfaced to the user by default, and the remaining result sets are drained and discarded.
 
-The initial output policy should be explicit and documented:
+The implementation must drain all outstanding remote results before releasing the connection back to the pool.
 
-- If there is one result set, return it.
-- If there are multiple result sets, return the first result set and drain the rest.
-- If there are no row-producing result sets, return a single status row or an empty result according to the selected API contract.
-
-A later enhancement can expose a result-set index or a nested result representation.
+This requires adding or extending the result API to support iteration over multiple MySQL result sets and to explicitly skip or drain the remaining ones. The plan must confirm whether the client library exposes `mysql_next_result` (basic API) or `mysql_stmt_next_result` (prepared-statement API) and implement one consistent flow around it.
 
 ### 5.3 Connection capabilities
 
-Review connection creation in `mysql_connection.cpp` and ensure the required multi-result capability is requested. Add only the minimum client flags necessary.
+Before changing connection flags, verify the current default connection config used by MySQLUtils/Connect. The current code already includes `CLIENT_MULTI_STATEMENTS` and should be checked for whether it also satisfies the required multi-result behavior for stored procedures.
 
-Audit the effect on existing operations, especially `mysql_execute`, because enabling multi-statement behavior can change how semicolon-separated SQL is handled. Do not weaken parameter binding or introduce string concatenation for values.
+The plan must not assume that multi-result capability is missing without verifying the actual client/library side. The implementation should:
 
-### 5.4 Parameter binding
+- confirm whether `CLIENT_MULTI_RESULTS` is already present or required;
+- avoid broad client-flag changes unless tests prove they are needed;
+- audit the impact on `mysql_query` and `mysql_execute` behavior.
+
+### 5.4 Parameter binding and safety
 
 For `IN` parameters:
 
 - use prepared statements and bound values;
 - reuse existing value-to-MySQL type conversion code;
-- never concatenate user-provided values into SQL text.
+- never concatenate user input into SQL text;
+- preserve `NULL`/`BOOLEAN`/`DATE`/`TIME`/large-text conversions through the existing conversion pipeline.
 
-For procedure and schema identifiers:
+For procedure identifiers and schema names:
 
-- validate identifiers;
+- validate them;
 - quote them with the existing MySQL identifier writer;
-- reject malformed or qualified names that are ambiguous under the API contract.
+- reject malformed or ambiguous names.
 
-For `OUT` and `INOUT` parameters, implement the MVP with connection-local variables:
+For `OUT` and `INOUT` parameters:
 
-```sql
-CALL `schema`.`proc`(?, @duckdb_out_0, @duckdb_out_1);
-SELECT @duckdb_out_0, @duckdb_out_1;
-```
+- defer them until after the `IN`-only MVP works;
+- do not promise them in the first PR;
+- if prototyping is required, use a connection-local session-variable pattern only as an implementation experiment, not as the final API contract.
 
-Use unique generated variable names and execute the `CALL` plus output retrieval on the same pinned connection. Document that output-parameter metadata or an explicit parameter mode API is required to distinguish `IN`, `OUT`, and `INOUT` values.
+This keeps the initial plan implementation-safe and reviewable.
 
-Native output binding through `MYSQL_STMT` can be considered after the session-variable approach is working.
+### 5.5 Result schema and output contract
 
-### 5.5 Result schema
+The MVP should fix a single contract:
 
-For the MVP:
+- if the remote procedure returns rows, expose those columns directly;
+- if it does not, expose `rowcount BIGINT` (or another explicit status shape) and document that output is status-only.
 
-- expose the columns of the first remote result set directly;
-- if no result set exists, return a status row containing affected-row count and/or success status;
-- expose output parameters either as trailing columns or as a separate single-row result, choosing one contract and documenting it clearly.
+This is simpler and more consistent with the existing `mysql_query` design and avoids trying to merge multiple result-set schemas into one table.
 
-Prefer a stable schema per invocation. Do not attempt to combine unrelated schemas from multiple result sets into one table.
+### 5.6 Transaction and connection semantics
+
+The plan must explicitly define transaction behavior. `mysql_query` already has a dedicated connection/pinning mechanism. `mysql_call` should follow the same rules:
+
+- by default, use the same pinned/transaction connection semantics as `mysql_query`;
+- allow an explicit connection override only if the existing API already supports that pattern;
+- pin the connection until the full stored-procedure execution and result draining are complete;
+- do not return the connection to the pool until all results are consumed and any output retrieval/cleanup is done.
+
+This is critical because a partially consumed result set would leave the pool in a bad state and could poison subsequent queries.
 
 ## 6. Implementation phases
 
-### Phase 1: investigate and define contracts
+### Phase 1: investigate and define the contract
 
-1. Trace the current query execution path from `MySQLQueryFunction` through connection pooling and `MySQLResult`.
-2. Confirm whether the connector currently supports `mysql_next_result` or `mysql_stmt_next_result`.
-3. Confirm how prepared statements, result metadata, NULL values, and type conversion are represented.
-4. Decide the exact SQL signature and output schema for `mysql_call`.
-5. Decide whether the first release returns only the first result set or allows a result-set selector.
+1. Trace the query execution flow for `mysql_query` and `mysql_execute` through `MySQLConnection`, `MySQLStatement`, and the connection pool.
+2. Confirm whether the library/client already supports multi-result handling in the current connection configuration.
+3. Confirm how prepared statements and result metadata behave for `CALL` queries.
+4. Decide the final `mysql_call` API shape (`params := row(...)` or equivalent) and the exact rowcount/status contract.
+5. Decide whether the first release exposes only the first result set or supports a selector in the future.
 
-### Phase 2: safe result draining
+### Phase 2: safe result-draining and connection lifecycle
 
-1. Add a reusable multi-result iterator to the connection/result layer.
-2. Ensure all result packets are consumed before a pooled connection is released.
-3. Add tests for a procedure that returns two `SELECT` result sets.
-4. Add failure-path tests where result iteration is interrupted by a remote error.
+1. Add a reusable multi-result iterator or helper in the connection/result layer.
+2. Ensure all remote result sets are consumed before releasing a pooled connection.
+3. Add tests for procedures generating two or more result sets.
+4. Add failure-path tests where the remote procedure errors mid-cycle or leaves pending results.
+5. Add check coverage for `DETACH`, prepared statements, and connection reuse after failure.
 
 ### Phase 3: `mysql_call` MVP
 
 1. Add `MySQLCallBindData` and `MySQLCallFunction`.
 2. Register the function in `mysql_extension.cpp`.
-3. Resolve the attached `MySQLCatalog` and acquire a pinned connection.
-4. Construct and execute `CALL schema.proc(?, ?, ...)` with prepared input parameters.
-5. Stream the first result set using existing MySQL field/type conversion logic.
-6. Drain all remaining result sets.
-7. Return clear errors for missing procedure, bad argument count, and remote execution failures.
+3. Resolve the attached catalog and acquire a pinned connection as needed.
+4. Build a parameterized `CALL schema.proc(...)` statement using prepared values.
+5. Execute the call and stream the first result set using the existing MySQL field/type conversion path.
+6. Drain all remaining results.
+7. Return clear errors for missing procedure, wrong arity, and remote execution failures.
 
-### Phase 4: `OUT` and `INOUT` parameters
+### Phase 4: `OUT` / `INOUT` research and optional prototype
 
-1. Add an explicit parameter-mode representation to bind data.
-2. Generate collision-resistant session-variable names.
-3. Execute the call and output retrieval on one pinned connection.
-4. Convert output values through existing MySQL-to-DuckDB conversion code.
-5. Define and test behavior for NULL output values, binary values, decimals, dates, and large text values.
+1. Confirm how MySQL/MariaDB exposes output parameters and how they are represented in the client API.
+2. Evaluate whether native binding is available through the library and whether it fits the current architecture.
+3. If warranted, prototype a session-variable approach only for testing and validation.
+4. Defer any final support to a later PR after the `IN`-only contract is stable.
 
 ### Phase 5: metadata and validation
 
@@ -250,76 +257,75 @@ Optionally query `information_schema.ROUTINES` and `information_schema.PARAMETER
 
 - procedure existence;
 - parameter count;
-- parameter modes;
+- generic parameter modes;
 - declared types;
-- overloaded or ambiguous names, where supported by MySQL/MariaDB.
+- overload ambiguity, where supported by the server.
 
-Do not require metadata discovery for the MVP if it would add latency or privilege requirements. Runtime MySQL errors remain authoritative.
+Do not require metadata lookup for the MVP. Runtime MySQL errors remain authoritative, and the extension should prefer correctness and low extra latency over introspection.
 
-### Phase 6: scalar and table functions
+### Phase 6: optimizer and serialization support
 
-Verify whether `mysql_query` already supports remote scalar function invocation through `SELECT function_name(...)`. If it does, document that path rather than adding redundant extension APIs.
-
-If a dedicated API is needed, define it separately from procedure calls because scalar functions have expression semantics and table-valued functions have different result-shape requirements.
+1. Add `MySQLCatalog::IsMySQLCall` if needed and teach the optimizer how to handle the function's streaming behavior.
+2. Decide whether `mysql_call` participates in the same prepared-statement serialization logic as `mysql_query`.
+3. Ensure `DETACH` and catalog invalidation do not leave stale prepared calls behind.
+4. Add tests covering statement reuse across attached/detached sessions.
 
 ### Phase 7: documentation and release hardening
 
 Update `README.md` with:
 
-- basic procedure call example;
+- basic procedure-call example;
 - parameter binding examples;
-- result-set behavior;
-- `OUT`/`INOUT` behavior;
+- result-set behavior and limitations;
 - transaction and connection-pinning considerations;
-- limitations around multiple result sets and privileges.
+- limitations around multi-result procedures and `OUT`/`INOUT` parameters.
 
-Add SQL logic/integration tests for:
+Add integration tests for:
 
 - no-argument procedure;
 - `IN` parameters of several types;
 - one result set;
 - multiple result sets;
 - no result set;
-- `OUT` and `INOUT` parameters;
-- NULL and large values;
 - missing procedure;
 - wrong argument count;
 - remote procedure error;
-- connection reuse after success and failure.
+- connection reuse after success and failure;
+- prepared statement reuse and detach behavior.
 
 ## 7. Security and correctness requirements
 
-- Never interpolate parameter values into SQL.
+- Never interpolate user parameter values into the SQL string.
 - Quote only validated identifiers.
-- Ensure generated session-variable names cannot collide with application variables or user input.
-- Pin the connection until all result sets and output-variable reads are complete.
-- Drain all pending results before returning a connection to the pool.
-- Avoid leaking passwords or procedure arguments in error messages and logs.
+- Pin the connection until all result sets and cleanup operations are complete.
+- Drain all remaining result sets before a connection is released to the pool.
+- Avoid leaking procedure arguments or sensitive values in logs or error messages.
 - Verify behavior under concurrent calls using separate pooled connections.
-- Audit whether enabling multi-result or multi-statement client flags changes existing APIs.
+- Ensure `mysql_call` does not break existing `mysql_query` or `mysql_execute` behavior.
+- Keep the feature limited to the extension's shape and semantics rather than creating a vague, cross-layer procedure contract.
 
 ## 8. Recommended MVP
 
 The first pull request should implement:
 
-1. multi-result consumption and safe draining;
-2. `mysql_call(catalog, procedure_name, ...)`;
+1. safe multi-result consumption and connection draining;
+2. an extension-native `mysql_call(...)` function;
 3. prepared `IN` parameter binding;
 4. first-result-set streaming;
-5. clear limitation/documentation for additional result sets;
-6. comprehensive integration tests;
-7. README examples.
+5. rowcount/status output when the procedure does not return a row set;
+6. explicit documentation of the multi-result and non-row-return limitations;
+7. integration tests covering lifecycle correctness and connection reuse.
 
-Defer `OUT`/`INOUT` parameters, information-schema validation, nested multi-result output, and native DuckDB `CALL` integration until the MVP proves the connection and result lifecycle is correct.
+Defer `OUT`/`INOUT`, metadata-driven validation, and native DuckDB `CALL` syntax until the core storage-procedure behavior is proven correct.
 
 ## 9. Acceptance criteria
 
 The feature is ready for review when:
 
-- a remote procedure with `IN` parameters can be invoked from DuckDB;
+- a remote procedure with `IN` parameters can be invoked from DuckDB through the extension API;
 - returned rows have correct names, types, NULL handling, and values;
 - all remote results are consumed before connection reuse;
-- existing table scans, `mysql_query`, and `mysql_execute` tests remain unchanged and pass;
+- existing `mysql_query` and `mysql_execute` behavior is unchanged;
 - failures leave the connection pool in a reusable state;
-- the SQL API and limitations are documented;
+- the API contract is documented and the limitations are explicit;
 - tests cover both MySQL and MariaDB-compatible server behavior where supported.
