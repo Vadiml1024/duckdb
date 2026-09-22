@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index a7ea5cb..990ef3b 100644
+index a7ea5cb..9959e78 100644
 --- a/README.md
 +++ b/README.md
-@@ -168,6 +168,24 @@ SELECT * FROM mysql_db.tmp;
+@@ -168,6 +168,27 @@ SELECT * FROM mysql_db.tmp;
  
  > Note that DDL statements are not transactional in MySQL.
  
@@ -23,6 +23,9 @@ index a7ea5cb..990ef3b 100644
 +`mysql_call` returns the first result produced by the remote procedure. If the procedure does not produce a row
 +set, the function returns a single `rowcount BIGINT` column instead. Any remaining result sets are drained before
 +the connection is reused. `OUT` and `INOUT` parameters are not supported.
++
++Prepared statements can also use `params_handle` with `mysql_create_params` and `mysql_bind_params`, following the
++same workflow as `mysql_query`.
 +
  ## Settings
  |                name                |                          description                           | default |
@@ -92,10 +95,10 @@ index 48a5482..fbab737 100644
  public:
  	MySQLClearCacheFunction();
 diff --git a/src/include/storage/mysql_catalog.hpp b/src/include/storage/mysql_catalog.hpp
-index cad8ae8..9890d83 100644
+index cad8ae8..06665b0 100644
 --- a/src/include/storage/mysql_catalog.hpp
 +++ b/src/include/storage/mysql_catalog.hpp
-@@ -89,6 +89,7 @@ public:
+@@ -89,11 +89,15 @@ public:
  	static void MaterializeMySQLScans(PhysicalOperator &op);
  	static bool IsMySQLScan(const string &name);
  	static bool IsMySQLQuery(const string &name);
@@ -103,6 +106,14 @@ index cad8ae8..9890d83 100644
  
  	static dbconnector::attached::AttachedCatalog Lookup(ClientContext &ctx, const Identifier &name);
  
+ 	MySQLConnectionPool &GetConnectionPool();
+ 	shared_ptr<MySQLConnectionPool> GetConnectionPoolPtr();
++	const string &GetAttachedDatabaseName() const {
++		return default_schema;
++	}
+ 	//! The server version, fetched when the database was attached
+ 	const MySQLVersion &GetVersion() const {
+ 		return version;
 diff --git a/src/mysql_connection.cpp b/src/mysql_connection.cpp
 index e32e0d7..5199b8b 100644
 --- a/src/mysql_connection.cpp
@@ -261,10 +272,10 @@ index f8d8295..a242e29 100644
  		}
  
 diff --git a/src/mysql_scanner.cpp b/src/mysql_scanner.cpp
-index fb62257..711ab6d 100644
+index fb62257..950cdeb 100644
 --- a/src/mysql_scanner.cpp
 +++ b/src/mysql_scanner.cpp
-@@ -295,6 +295,36 @@ static bool ExtractFlag(TableFunctionBindInput &input, const string &name, bool
+@@ -295,6 +295,60 @@ static bool ExtractFlag(TableFunctionBindInput &input, const string &name, bool
  	return default_val;
  }
  
@@ -298,10 +309,34 @@ index fb62257..711ab6d 100644
 +	return query;
 +}
 +
++static idx_t GetProcedureParameterCount(MySQLConnection &conn, MySQLCatalog &catalog, const QualifiedName &procedure_name) {
++	string schema_name;
++	if (!procedure_name.Schema().empty()) {
++		schema_name = procedure_name.Schema().GetIdentifierName();
++	} else {
++		schema_name = catalog.GetAttachedDatabaseName();
++		if (schema_name.empty()) {
++			throw BinderException("mysql_call with params_handle requires a schema-qualified procedure name when the "
++			                      "attached MySQL database has no default schema");
++		}
++	}
++	vector<Value> metadata_params;
++	metadata_params.emplace_back(schema_name);
++	metadata_params.emplace_back(procedure_name.Name().GetIdentifierName());
++	auto metadata_result = conn.Query(
++	    "SELECT count(*)::BIGINT AS param_count FROM information_schema.parameters "
++	    "WHERE specific_schema = ? AND specific_name = ? AND ordinal_position > 0",
++	    metadata_params, MySQLResultStreaming::FORCE_MATERIALIZATION);
++	if (!metadata_result->Next()) {
++		throw InternalException("Failed to fetch procedure parameter count for \"%s\"", procedure_name.ToString());
++	}
++	return UnsafeNumericCast<idx_t>(metadata_result->GetInt64(0));
++}
++
  static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
  	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
-@@ -380,6 +410,75 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
+@@ -380,6 +434,78 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
  	}
  }
  
@@ -315,8 +350,8 @@ index fb62257..711ab6d 100644
 +	MySQLCatalog &catalog = GetCatalogByName(context, db_name);
 +	auto procedure_name = ExtractProcedureName(input.inputs[1]);
 +	vector<Value> params = ExtractParams(input);
++	int64_t params_handle = ExtractParamsHandle(input);
 +	uint64_t pinned_connection_id = ExtractPinnedConnId(input);
-+	auto query = CreateCallQuery(procedure_name, params.size());
 +
 +	bool tran_restrict_dml = false;
 +	try {
@@ -348,6 +383,8 @@ index fb62257..711ab6d 100644
 +		});
 +
 +		MySQLConnection &conn = *conn_ptr;
++		auto param_count = params_handle != 0 ? GetProcedureParameterCount(conn, catalog, procedure_name) : params.size();
++		auto query = CreateCallQuery(procedure_name, param_count);
 +		unique_ptr<MySQLStatement> stmt = conn.Prepare(query);
 +		if (stmt->Fields().size() > 0) {
 +			for (auto &field : stmt->Fields()) {
@@ -364,7 +401,8 @@ index fb62257..711ab6d 100644
 +
 +		QueryResult::DeduplicateColumns(names);
 +
-+		return make_uniq<MySQLQueryBindData>(catalog, query, std::move(params), 0, std::move(stmt->FieldsCopy()),
++		return make_uniq<MySQLQueryBindData>(catalog, query, std::move(params), params_handle,
++		                                     std::move(stmt->FieldsCopy()),
 +		                                     MySQLResultStreamingUser::UNINITIALIZED, std::move(stmt),
 +		                                     prepare_connection_id, pinned_connection_id);
 +	} catch (const std::exception &ex) {
@@ -377,7 +415,7 @@ index fb62257..711ab6d 100644
  static unique_ptr<GlobalTableFunctionState> MySQLQueryInitGlobalState(ClientContext &ctx,
                                                                        TableFunctionInitInput &input) {
  	auto &bdata = input.bind_data->CastNoConst<MySQLQueryBindData>();
-@@ -488,7 +587,9 @@ static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, Dat
+@@ -488,7 +614,9 @@ static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, Dat
  	}
  
  	if (bdata.fields.size() == 0) {
@@ -388,7 +426,7 @@ index fb62257..711ab6d 100644
  		gstate.exec_state = MySQLQueryExecState::EXHAUSTED;
  		return;
  	}
-@@ -509,6 +610,15 @@ MySQLQueryFunction::MySQLQueryFunction()
+@@ -509,6 +637,16 @@ MySQLQueryFunction::MySQLQueryFunction()
  	named_parameters["suppress_dml_output"] = LogicalType::BOOLEAN;
  }
  
@@ -398,6 +436,7 @@ index fb62257..711ab6d 100644
 +	serialize = MySQLScanSerialize;
 +	deserialize = MySQLScanDeserialize;
 +	named_parameters["params"] = LogicalType::ANY;
++	named_parameters["params_handle"] = LogicalType::BIGINT;
 +	named_parameters["connection"] = LogicalType::UBIGINT;
 +}
 +
@@ -453,10 +492,10 @@ index 3d654ba..3afef1a 100644
  				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
 diff --git a/test/sql/mysql_call.test b/test/sql/mysql_call.test
 new file mode 100644
-index 0000000..bcbe35a
+index 0000000..f7047f5
 --- /dev/null
 +++ b/test/sql/mysql_call.test
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,209 @@
 +# name: test/sql/mysql_call.test
 +# description: Test mysql_call
 +# group: [sql]
@@ -536,6 +575,95 @@ index 0000000..bcbe35a
 +FROM mysql_query('s', 'SELECT cnt FROM duckdb_proc_state')
 +----
 +1
++
++statement ok
++SET VARIABLE conn = mysql_pin_connection('s')
++
++statement ok
++SET VARIABLE p1 = mysql_create_params()
++
++statement ok
++PREPARE call_stmt1 AS FROM mysql_call('s', 'duckdb_proc_args',
++  params_handle=getvariable('p1'),
++  connection=getvariable('conn'))
++
++statement ok
++SELECT mysql_bind_params(getvariable('p1'), row(2027, 'CA'))
++
++query II
++EXECUTE call_stmt1
++----
++2027	CA
++
++statement ok
++SELECT mysql_bind_params(getvariable('p1'), row(2028, 'EU'))
++
++query II
++EXECUTE call_stmt1
++----
++2028	EU
++
++statement ok
++DEALLOCATE call_stmt1
++
++statement error
++SELECT mysql_bind_params(getvariable('p1'), row(2029, 'APAC'))
++----
++Specified parameters handle not found
++
++statement ok
++RESET VARIABLE p1
++
++statement ok
++SELECT mysql_close_pinned_connection('s', getvariable('conn'))
++
++statement ok
++BEGIN TRANSACTION
++
++statement ok
++SET VARIABLE p2 = mysql_create_params()
++
++statement ok
++PREPARE call_stmt2 AS FROM mysql_call('s', 'duckdb_proc_args',
++  params_handle=getvariable('p2'))
++
++statement ok
++SELECT mysql_bind_params(getvariable('p2'), row(2030, 'LATAM'))
++
++query II
++EXECUTE call_stmt2
++----
++2030	LATAM
++
++statement ok
++DEALLOCATE call_stmt2
++
++statement ok
++RESET VARIABLE p2
++
++statement ok
++COMMIT
++
++statement ok
++SET VARIABLE p3 = mysql_create_params()
++
++statement ok
++PREPARE call_stmt3 AS FROM mysql_call('s', 'duckdb_proc_args',
++  params_handle=getvariable('p3'))
++
++statement ok
++SELECT mysql_bind_params(getvariable('p3'), row(2031, 'MEA'))
++
++statement error
++EXECUTE call_stmt3
++----
++MySQL connection is no longer available to reuse the prepared statement
++
++statement ok
++DEALLOCATE call_stmt3
++
++statement ok
++RESET VARIABLE p3
 +
 +statement error
 +FROM mysql_call('s', 'duckdb_proc_args', params=row(2026))
