@@ -30,10 +30,10 @@ index e04be0c..0ed02cf 100644
  				// positional reference (e.g. ORDER BY 1) - resolve it against the select list
  				// SupportsPushdown verifies that this resolution is possible
 diff --git a/src/storage/mysql_catalog.cpp b/src/storage/mysql_catalog.cpp
-index 7210afd..7a5a506 100644
+index c444902..c544aec 100644
 --- a/src/storage/mysql_catalog.cpp
 +++ b/src/storage/mysql_catalog.cpp
-@@ -568,11 +568,11 @@ unique_ptr<TableRef> MySQLCatalog::RemoteExecute(ClientContext &context, unique_
+@@ -569,11 +569,11 @@ unique_ptr<TableRef> MySQLCatalog::RemoteExecute(ClientContext &context, unique_
  
  unique_ptr<TableRef> MySQLCatalog::RemoteExecute(ClientContext &context, const string &sql) {
  	vector<unique_ptr<ParsedExpression>> args;
@@ -48,7 +48,7 @@ index 7210afd..7a5a506 100644
  	auto func_ref = make_uniq<TableFunctionRef>();
  	func_ref->function = make_uniq<FunctionExpression>("mysql_query", std::move(args));
  	return func_ref;
-@@ -1029,7 +1029,7 @@ static bool MySQLSupportsOrderEntries(const MySQLVersion &version, const vector<
+@@ -1030,7 +1030,7 @@ static bool MySQLSupportsOrderEntries(const MySQLVersion &version, const vector<
  			}
  		}
  		if (expr.GetExpressionClass() == ExpressionClass::CONSTANT) {
@@ -57,7 +57,7 @@ index 7210afd..7a5a506 100644
  			if (!val.type().IsIntegral()) {
  				// ORDER BY with a non-integer literal is a binder error in DuckDB (unless
  				// order_by_non_integer_literal is set), while MySQL silently ignores it
-@@ -1065,7 +1065,7 @@ static bool MySQLIsIntegerLiteral(const ParsedExpression &expr) {
+@@ -1066,7 +1066,7 @@ static bool MySQLIsIntegerLiteral(const ParsedExpression &expr) {
  	if (expr.GetExpressionClass() != ExpressionClass::CONSTANT) {
  		return false;
  	}
@@ -66,7 +66,7 @@ index 7210afd..7a5a506 100644
  	return val.type().IsIntegral() && !val.IsNull();
  }
  
-@@ -1073,7 +1073,7 @@ static bool MySQLIsIntegerLiteralAtLeast(const ParsedExpression &expr, int64_t m
+@@ -1074,7 +1074,7 @@ static bool MySQLIsIntegerLiteralAtLeast(const ParsedExpression &expr, int64_t m
  	if (!MySQLIsIntegerLiteral(expr)) {
  		return false;
  	}
@@ -75,7 +75,7 @@ index 7210afd..7a5a506 100644
  	auto bigint_value = val.DefaultTryCastAs(LogicalType::BIGINT);
  	if (!bigint_value || bigint_value->IsNull()) {
  		return false;
-@@ -1085,7 +1085,7 @@ static bool MySQLIsIntegerLiteralAtMost(const ParsedExpression &expr, int64_t ma
+@@ -1086,7 +1086,7 @@ static bool MySQLIsIntegerLiteralAtMost(const ParsedExpression &expr, int64_t ma
  	if (!MySQLIsIntegerLiteral(expr)) {
  		return false;
  	}
@@ -84,7 +84,7 @@ index 7210afd..7a5a506 100644
  	auto bigint_value = val.DefaultTryCastAs(LogicalType::BIGINT);
  	if (!bigint_value || bigint_value->IsNull()) {
  		return false;
-@@ -1285,7 +1285,7 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
+@@ -1286,7 +1286,7 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
  		// MySQLSQLWriter::WriteExpression) - verify here that this is possible. Casts of
  		// non-literal expressions over malformed data remain a documented limitation.
  		if (cast_expr.Child().GetExpressionClass() == ExpressionClass::CONSTANT) {
@@ -93,7 +93,7 @@ index 7210afd..7a5a506 100644
  			auto cast_result = value.DefaultTryCastAs(target_type);
  			if (!cast_result) {
  				return false;
-@@ -1302,8 +1302,7 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
+@@ -1303,8 +1303,7 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
  		return true;
  	}
  	case ExpressionClass::CONSTANT: {

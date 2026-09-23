@@ -1,0 +1,69 @@
+diff --git a/test/sql/mysql_call.test b/test/sql/mysql_call.test
+index f7047f5..c933895 100644
+--- a/test/sql/mysql_call.test
++++ b/test/sql/mysql_call.test
+@@ -1,5 +1,5 @@
+ # name: test/sql/mysql_call.test
+-# description: Test mysql_call
++# description: Test mysql_call stored procedures on MySQL and MariaDB
+ # group: [sql]
+ 
+ require mysql_scanner
+@@ -43,16 +43,21 @@ statement ok
+ CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_multi() BEGIN SELECT ''first'' AS result_tag; SELECT ''second'' AS ignored_result; END', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_no_result() UPDATE duckdb_proc_state SET cnt = cnt + 1', prepare=FALSE)
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_no_result() BEGIN UPDATE duckdb_proc_state SET cnt = cnt + 1; END', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_error() SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''duckdb_proc_error''', prepare=FALSE)
++CALL mysql_execute('s', 'CREATE PROCEDURE duckdb_proc_error() BEGIN SELECT cnt FROM duckdb_proc_missing_state; END', prepare=FALSE)
+ 
+ query I
+ FROM mysql_call('s', 'duckdb_proc_no_args')
+ ----
+ 42
+ 
++query I
++CALL mysql_call('s', 'duckdb_proc_no_args')
++----
++42
++
+ query II
+ FROM mysql_call('s', 'duckdb_proc_args', params=row(2026, 'US'))
+ ----
+@@ -180,7 +185,7 @@ FROM mysql_call('s', 'duckdb_missing_proc')
+ statement error
+ FROM mysql_call('s', 'duckdb_proc_error')
+ ----
+-<REGEX>:.*duckdb_proc_error.*
++<REGEX>:.*duckdb_proc_missing_state.*
+ 
+ query I
+ FROM mysql_query('s', 'SELECT 7')
+@@ -188,19 +193,19 @@ FROM mysql_query('s', 'SELECT 7')
+ 7
+ 
+ statement ok
+-CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_error', prepare=FALSE)
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_error', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_no_result', prepare=FALSE)
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_no_result', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_multi', prepare=FALSE)
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_multi', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_args', prepare=FALSE)
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_args', prepare=FALSE)
+ 
+ statement ok
+-CALL mysql_execute('s', 'DROP PROCEDURE duckdb_proc_no_args', prepare=FALSE)
++CALL mysql_execute('s', 'DROP PROCEDURE IF EXISTS duckdb_proc_no_args', prepare=FALSE)
+ 
+ statement ok
+ CALL mysql_execute('s', 'DROP TABLE duckdb_proc_state', prepare=FALSE)

@@ -26,10 +26,10 @@ index a610c64..e04be0c 100644
  	case ExpressionClass::BETWEEN: {
  		auto &between = expr.Cast<BetweenExpression>();
 diff --git a/src/storage/mysql_catalog.cpp b/src/storage/mysql_catalog.cpp
-index d8a2dde..7210afd 100644
+index 87c0356..c444902 100644
 --- a/src/storage/mysql_catalog.cpp
 +++ b/src/storage/mysql_catalog.cpp
-@@ -1271,7 +1271,9 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
+@@ -1272,7 +1272,9 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
  			// MySQL has no TRY_CAST
  			return false;
  		}
@@ -40,7 +40,7 @@ index d8a2dde..7210afd 100644
  			return false;
  		}
  		// MySQL's CAST semantics differ from DuckDB's in several ways: malformed input returns
-@@ -1284,10 +1286,6 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
+@@ -1285,10 +1287,6 @@ bool MySQLCatalog::SupportsPushdown(const ParsedExpression &expr) {
  		// non-literal expressions over malformed data remain a documented limitation.
  		if (cast_expr.Child().GetExpressionClass() == ExpressionClass::CONSTANT) {
  			auto &value = cast_expr.Child().Cast<ConstantExpression>().GetValue();
